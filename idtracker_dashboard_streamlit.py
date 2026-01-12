@@ -237,104 +237,124 @@ with st.sidebar.expander("打開量測工具", expanded=False):
             st.write(f"Image size: {w}×{h} px")
             st.caption("點一下回報座標；若要定 ROI_0，請連點兩次（左上→右下）。")
 
-            bg_url = pil_to_data_url(img, fmt="PNG")
+            canvas = None
+            canvas_err = None
 
-            # ✅ 關鍵：用 background_image_url（data URL），避免 Cloud 的 image_to_url 出錯
-            canvas = st_canvas(
-                fill_color="rgba(255, 0, 0, 0.0)",
-                stroke_width=2,
-                stroke_color="rgba(0, 255, 255, 1.0)",
-                background_image_url=bg_url,
-                update_streamlit=True,
-                height=h,
-                width=w,
-                drawing_mode="point",
-                point_display_radius=4,
-                key="roi_measure_canvas",
-            )
+            # 1) 先試 background_image_url（你那邊目前會 TypeError，所以要 try）
+            try:
+                bg_url = pil_to_data_url(img, fmt="PNG")
+                canvas = st_canvas(
+                    fill_color="rgba(255, 0, 0, 0.0)",
+                    stroke_width=2,
+                    stroke_color="rgba(0, 255, 255, 1.0)",
+                    background_image_url=bg_url,
+                    update_streamlit=True,
+                    height=h,
+                    width=w,
+                    drawing_mode="point",
+                    point_display_radius=4,
+                    key="roi_measure_canvas",
+                )
+            except TypeError as e:
+                canvas_err = e
 
-            # 讀取最後一個點
-            if canvas.json_data is not None:
-                objs = canvas.json_data.get("objects", [])
-                if len(objs) > 0:
-                    last = objs[-1]
-                    x_px = float(last.get("left", np.nan))
-                    y_px = float(last.get("top", np.nan))
+            # 2) 不支援 background_image_url → 改用 background_image=img
+            if canvas is None:
+                try:
+                    canvas = st_canvas(
+                        fill_color="rgba(255, 0, 0, 0.0)",
+                        stroke_width=2,
+                        stroke_color="rgba(0, 255, 255, 1.0)",
+                        background_image=img,
+                        update_streamlit=True,
+                        height=h,
+                        width=w,
+                        drawing_mode="point",
+                        point_display_radius=4,
+                        key="roi_measure_canvas",
+                    )
+                    canvas_err = None
+                except Exception as e:
+                    canvas_err = e
+                    canvas = None
 
-                    if np.isfinite(x_px) and np.isfinite(y_px):
-                        x_mm = x_px * px_to_mm
-                        y_mm = y_px * px_to_mm
-                        st.success(f"點選：x={x_px:.1f}px, y={y_px:.1f}px  ｜  x={x_mm:.2f}mm, y={y_mm:.2f}mm")
-
-                        # 只在點位與上一點差異>1px 時才加入，避免重複累積
-                        pts = st.session_state.roi_pts
-                        if len(pts) == 0 or (abs(pts[-1][0] - x_px) > 1 or abs(pts[-1][1] - y_px) > 1):
-                            pts.append((x_px, y_px))
-                            # 只保留前 2 點（ROI_0）
-                            st.session_state.roi_pts = pts[:2]
-
-            colA, colB = st.columns([1, 2])
-            with colA:
-                if st.button("清空點位", key="roi_clear_pts"):
-                    st.session_state.roi_pts = []
-                    st.rerun()
-            with colB:
-                st.write(f"已記錄點數：{len(st.session_state.roi_pts)}")
-                if len(st.session_state.roi_pts) > 0:
-                    st.write("Points (px):", st.session_state.roi_pts)
-
-            # ROI_0 兩點 → 數值 + 預覽 + Apply
-            if len(st.session_state.roi_pts) >= 2:
-                (x1p, y1p) = st.session_state.roi_pts[0]
-                (x2p, y2p) = st.session_state.roi_pts[1]
-                rx1, rx2 = min(x1p, x2p), max(x1p, x2p)
-                ry1, ry2 = min(y1p, y2p), max(y1p, y2p)
-
-                st.markdown("**ROI_0 (px)**")
-                st.code(f"({rx1:.1f}, {ry1:.1f}, {rx2:.1f}, {ry2:.1f})")
-
-                st.markdown("**ROI_0 (mm)**")
-                st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
-
-                # 分割線預覽（用 matplotlib 疊在 PNG 上）
-                figp, axp = plt.subplots(figsize=(6, 4))
-                axp.imshow(img, origin="upper")
-                axp.add_patch(Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=2))
-                w0 = (rx2 - rx1)
-                xL = rx1 + w0 / 3.0
-                xR = rx1 + 2.0 * w0 / 3.0
-                axp.axvline(xL, lw=2)
-                axp.axvline(xR, lw=2)
-                axp.set_title("ROI_0 + split 1/3 preview (image coords)")
-                axp.set_xlabel("X (px)")
-                axp.set_ylabel("Y (px)")
-                st.pyplot(figp)
-
-                # ✅ Apply 按鈕（只用 session_state.roi_pts 計算，不會 NameError）
-                col_ap1, col_ap2 = st.columns([1, 2])
-                with col_ap1:
-                    if st.button("✅ Apply ROI to plots", key="btn_apply_roi_to_plots"):
-                        st.session_state["roi0_x1"] = float(rx1)
-                        st.session_state["roi0_y1"] = float(ry1)
-                        st.session_state["roi0_x2"] = float(rx2)
-                        st.session_state["roi0_y2"] = float(ry2)
-
-                        # 切到 Manual 模式
-                        st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
-
-                        # 自動只顯示 ROI_0 + Left/Right（含 mid 視 include_mid）
-                        wanted = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
-                        if st.session_state.get("include_mid", True):
-                            wanted.insert(2, "ROI_MID_1_3")
-                        st.session_state["show_rois"] = wanted
-
-                        st.rerun()
-                with col_ap2:
-                    st.caption("按下後：ROI_0 會自動填入 Manual ROI_0，並讓下方 px 軌跡圖只顯示 ROI_0 + Left/Right（可選含 MID）。")
-
-                st.caption("若你要分析左右兩側：建議 ROI_0 框包含完整 device 外框，左右 1/3 會自動從 ROI_0 切出。")
+            # 3) 如果 canvas 還是掛（常見是 image_to_url 不相容），就降級：不用點選，改手動 ROI
+            if canvas is None:
+                st.error("⚠️ 點選量測工具目前在你的 Streamlit Cloud 環境無法使用（drawable-canvas 與 streamlit 版本不相容）。")
+                st.caption("你仍可：直接在下方 Manual ROI_0 (px) 手動輸入，再讓程式自動切 Left/Right 1/3 來分析。")
+                st.caption(f"錯誤類型：{type(canvas_err).__name__} | {canvas_err}")
             else:
-                st.info("提示：要啟用 Apply ROI，請先在 PNG 上點兩次定義 ROI_0。")
+                # 讀取最後一個點
+                if canvas.json_data is not None:
+                    objs = canvas.json_data.get("objects", [])
+                    if len(objs) > 0:
+                        last = objs[-1]
+                        x_px = float(last.get("left", np.nan))
+                        y_px = float(last.get("top", np.nan))
+
+                        if np.isfinite(x_px) and np.isfinite(y_px):
+                            x_mm = x_px * px_to_mm
+                            y_mm = y_px * px_to_mm
+                            st.success(f"點選：x={x_px:.1f}px, y={y_px:.1f}px  ｜  x={x_mm:.2f}mm, y={y_mm:.2f}mm")
+
+                            pts = st.session_state.roi_pts
+                            if len(pts) == 0 or (abs(pts[-1][0] - x_px) > 1 or abs(pts[-1][1] - y_px) > 1):
+                                pts.append((x_px, y_px))
+                                st.session_state.roi_pts = pts[:2]
+
+                colA, colB = st.columns([1, 2])
+                with colA:
+                    if st.button("清空點位", key="roi_clear_pts"):
+                        st.session_state.roi_pts = []
+                        st.rerun()
+                with colB:
+                    st.write(f"已記錄點數：{len(st.session_state.roi_pts)}")
+                    if len(st.session_state.roi_pts) > 0:
+                        st.write("Points (px):", st.session_state.roi_pts)
+
+                # ROI_0 兩點 → 數值 + 預覽 + Apply
+                if len(st.session_state.roi_pts) >= 2:
+                    (x1p, y1p) = st.session_state.roi_pts[0]
+                    (x2p, y2p) = st.session_state.roi_pts[1]
+                    rx1, rx2 = min(x1p, x2p), max(x1p, x2p)
+                    ry1, ry2 = min(y1p, y2p), max(y1p, y2p)
+
+                    st.markdown("**ROI_0 (px)**")
+                    st.code(f"({rx1:.1f}, {ry1:.1f}, {rx2:.1f}, {ry2:.1f})")
+
+                    st.markdown("**ROI_0 (mm)**")
+                    st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
+
+                    figp, axp = plt.subplots(figsize=(6, 4))
+                    axp.imshow(img, origin="upper")
+                    axp.add_patch(Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=2))
+                    w0 = (rx2 - rx1)
+                    xL = rx1 + w0 / 3.0
+                    xR = rx1 + 2.0 * w0 / 3.0
+                    axp.axvline(xL, lw=2)
+                    axp.axvline(xR, lw=2)
+                    axp.set_title("ROI_0 + split 1/3 preview (image coords)")
+                    axp.set_xlabel("X (px)")
+                    axp.set_ylabel("Y (px)")
+                    st.pyplot(figp)
+
+                    col_ap1, col_ap2 = st.columns([1, 2])
+                    with col_ap1:
+                        if st.button("✅ Apply ROI to plots", key="btn_apply_roi_to_plots"):
+                            st.session_state["roi0_x1"] = float(rx1)
+                            st.session_state["roi0_y1"] = float(ry1)
+                            st.session_state["roi0_x2"] = float(rx2)
+                            st.session_state["roi0_y2"] = float(ry2)
+                            st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
+
+                            wanted = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
+                            if st.session_state.get("include_mid", True):
+                                wanted.insert(2, "ROI_MID_1_3")
+                            st.session_state["show_rois"] = wanted
+                            st.rerun()
+                    with col_ap2:
+                        st.caption("按下後：ROI_0 會自動填入 Manual ROI_0，並讓下方圖只顯示 ROI_0 + Left/Right（可選含 MID）。")
+
 
 
 # ---------------------- Manual ROI_0 inputs（可被量測工具一鍵填入） ----------------------
