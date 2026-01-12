@@ -1,10 +1,12 @@
 # idtracker_dashboard_streamlit.py
-# 覆蓋版（2026-01-13 / FIX v2.2）
-# 修正：
-# 1) Heatmap：每個 heatmap 都用「新的 fig/ax」，避免疊圖與多重 colorbar
-# 2) Heatmap：移除重複 imshow/colorbar；加入 vmax（percentile）讓熱圖看得見
-# 3) px_to_mm：加入「短邊(mm)校正」— 量測 ROI_0 後，可輸入 ROI 短邊實際 mm，自動換算 px_to_mm(mm/px)
-# 4) StreamlitAPIException：任何 widget 綁定 key 的值（roi_mode/show_rois/px_to_mm）都用 *_pending + rerun 套用
+# 覆蓋版（2026-01-13 / FIX v2.3）
+# 版本變更說明：
+# 1) ✅ PI 表格新增欄位：Focal_side（你勾選的 Left/Right）
+# 2) ✅ 新增 PI_focal：以 focal_side 為正的 PI（focal=Right 時自動反號）
+# 3) ✅ Sidebar 新增：Experiment ID、Condition(Experiment/Control)、Focal_side(Left/Right)
+# 4) ✅ 匯出（Excel/CSV/PDF/ZIP）一併帶出：Experiment ID / Condition / Focal_side / PI_focal
+# 5) ✅ ROI 量測後可輸入「矩形短邊(mm)」→ 一鍵換算 px_to_mm（mm/px），用 pending 安全更新
+# 6) ✅ 修正 Heatmap 畫法：每個 heatmap 都新建 fig/ax（避免你看到「不是 heatmap」的怪圖）
 #
 # requirements.txt 建議：
 # streamlit
@@ -19,7 +21,6 @@
 
 import os
 import io
-import math
 import tempfile
 import zipfile
 import base64
@@ -120,25 +121,18 @@ def _safe_bins(vmin, vmax, bin_size, max_bins=800):
     return b
 
 
-def _finite_xy(xy: np.ndarray) -> np.ndarray:
-    if xy.size == 0:
-        return xy
-    m = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
-    return xy[m]
-
-
 # ---------------------- App 設定 ----------------------
 st.set_page_config(layout="wide")
 st.title("🐭 idtracker.ai Dashboard")
 
 # ---- apply pending widget state BEFORE widgets are created ----
-# (避免 StreamlitAPIException：不能在 widget 建立後改它綁定的 key)
 if "roi_mode_pending" in st.session_state:
     st.session_state["roi_mode"] = st.session_state.pop("roi_mode_pending")
 
 if "show_rois_pending" in st.session_state:
     st.session_state["show_rois"] = st.session_state.pop("show_rois_pending")
 
+# ✅ new: px_to_mm pending (avoid StreamlitAPIException)
 if "px_to_mm_pending" in st.session_state:
     st.session_state["px_to_mm"] = st.session_state.pop("px_to_mm_pending")
 
@@ -147,6 +141,12 @@ uploaded = st.file_uploader("請上傳軌跡檔 (.h5 / .hdf5 / .npz)", type=["h5
 
 # ---------------------- Sidebar 先定義（量測會用到 px_to_mm） ----------------------
 st.sidebar.header("參數設定")
+
+# ✅ new: experiment metadata inputs
+exp_id = st.sidebar.text_input("Experiment ID", value=st.session_state.get("exp_id", ""), key="exp_id")
+condition = st.sidebar.radio("Condition", ["Experiment", "Control"], index=0, key="condition")
+focal_side = st.sidebar.radio("Focal side", ["Left", "Right"], index=0, key="focal_side")
+
 fps = st.sidebar.number_input("FPS", value=30.0, step=1.0, key="fps")
 
 px_to_mm = st.sidebar.number_input(
@@ -208,12 +208,11 @@ if img_file_main is not None:
     if _HAS_IMG_COORD:
         click = streamlit_image_coordinates(img_disp, key="img_coord")
     else:
-        st.warning("找不到 streamlit-image-coordinates，改用 drawable-canvas fallback（若你仍遇到底圖不顯示/錯位，請把 requirements.txt 加上 streamlit-image-coordinates）。")
+        st.warning("找不到 streamlit-image-coordinates，改用 drawable-canvas fallback（若仍遇到底圖不顯示/錯位，請 requirements.txt 加上 streamlit-image-coordinates）。")
 
         if not _HAS_CANVAS:
             st.error("同時缺少 streamlit-image-coordinates 與 streamlit-drawable-canvas，無法點選量測。")
         else:
-            # drawable-canvas fallback with data-url background
             bg_url = pil_to_data_url(img_disp, fmt="PNG")
             try:
                 canvas = st_canvas(
@@ -253,7 +252,7 @@ if img_file_main is not None:
         x_px = x_disp / scale
         y_px = y_disp / scale
 
-        # mm（使用目前 px_to_mm）
+        # mm
         x_mm = x_px * px_to_mm
         y_mm = y_px * px_to_mm
 
@@ -282,42 +281,44 @@ if img_file_main is not None:
         rx1, rx2 = min(x1p, x2p), max(x1p, x2p)
         ry1, ry2 = min(y1p, y2p), max(y1p, y2p)
 
+        w_px = float(rx2 - rx1)
+        h_px = float(ry2 - ry1)
+        short_px = float(min(w_px, h_px)) if (w_px > 0 and h_px > 0) else np.nan
+
         st.markdown("**ROI_0 (px)**")
         st.code(f"({rx1:.1f}, {ry1:.1f}, {rx2:.1f}, {ry2:.1f})")
 
-        st.markdown("**ROI_0 (mm)**（使用目前 px_to_mm）")
+        st.markdown("**ROI_0 (mm)** (using current px_to_mm)")
         st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
 
-        # --- NEW: 用 ROI 短邊實際長度(mm) 反推 px_to_mm ---
-        roi_w_px = float(rx2 - rx1)
-        roi_h_px = float(ry2 - ry1)
-        roi_short_px = float(min(roi_w_px, roi_h_px))
-        st.markdown("### 📏 用 ROI 短邊校正 px_to_mm")
-        st.caption("做法：你用兩點定義 ROI_0 後，輸入『ROI 短邊』的真實長度 (mm)，系統用 mm/px 反推 px_to_mm。")
-
-        colC, colD, colE = st.columns([1.3, 1, 1])
-        with colC:
+        # ✅ new: px_to_mm calibration from known short-side length (mm)
+        st.markdown("### 📏 px_to_mm 校正（用 ROI_0 短邊）")
+        colC1, colC2, colC3 = st.columns([1.2, 1.0, 1.2])
+        with colC1:
             short_mm = st.number_input(
-                "ROI 短邊真實長度 (mm)",
+                "ROI_0 短邊真實長度 (mm)",
+                min_value=0.0,
                 value=float(st.session_state.get("roi_short_mm", 0.0)),
                 step=0.1,
-                min_value=0.0,
                 key="roi_short_mm",
+                help="例如：你的矩形短邊實際是 20 mm，就填 20。",
             )
-        with colD:
-            st.write("短邊(px)")
-            st.code(f"{roi_short_px:.2f}")
-        with colE:
-            if st.button("用短邊換算 px_to_mm", key="btn_calib_px_to_mm"):
-                if short_mm <= 0 or roi_short_px <= 0:
-                    st.warning("短邊 mm 與短邊 px 都必須 > 0 才能校正。")
+        with colC2:
+            st.write("Short side (px)")
+            st.code("NaN" if not np.isfinite(short_px) else f"{short_px:.2f}")
+        with colC3:
+            if st.button("✅ 用短邊(mm)換算 px_to_mm", key="btn_calib_px_to_mm"):
+                if (not np.isfinite(short_px)) or short_px <= 0:
+                    st.error("ROI_0 短邊(px) 不合法。請先用兩點定義有效矩形 ROI_0。")
+                elif short_mm <= 0:
+                    st.error("短邊(mm) 必須 > 0。")
                 else:
-                    new_px_to_mm = float(short_mm) / float(roi_short_px)
+                    new_px_to_mm = float(short_mm) / float(short_px)
                     st.session_state["px_to_mm_pending"] = new_px_to_mm
-                    st.success(f"已計算 px_to_mm = {new_px_to_mm:.6f} mm/px（將 rerun 套用到 sidebar）")
+                    st.success(f"已設定新的 px_to_mm_pending = {new_px_to_mm:.6f} (mm/px)，即將 rerun 套用。")
                     st.rerun()
 
-        # ✅ 重要：不要直接改 roi_mode（它被 radio 綁 key="roi_mode"）
+        # ✅ 不直接改 roi_mode（它被 radio 綁 key="roi_mode"）
         if st.button("✅ Apply ROI_0 to Manual ROI inputs", key="apply_roi0_main"):
             st.session_state["roi0_x1"] = float(rx1)
             st.session_state["roi0_y1"] = float(ry1)
@@ -503,6 +504,9 @@ global_mean_ang = float(np.nanmean(np.concatenate([d["angvel"] for d in per_id.v
 df_global = pd.DataFrame(
     [
         {
+            "Experiment_ID": exp_id,
+            "Condition": condition,
+            "Focal_side": focal_side,
             "Total_distance_mm": round(global_distance_mm, 3),
             "Mean_speed_mm_s": round(global_mean_speed, 3) if np.isfinite(global_mean_speed) else np.nan,
             "Mean_ang_deg_s": round(global_mean_ang, 3) if np.isfinite(global_mean_ang) else np.nan,
@@ -535,6 +539,9 @@ for i in ids:
 
         df_dwell_rows.append(
             {
+                "Experiment_ID": exp_id,
+                "Condition": condition,
+                "Focal_side": focal_side,
                 "ID": i,
                 "ROI": name,
                 "Frames_in_ROI": frames_in,
@@ -546,7 +553,10 @@ for i in ids:
 
 df_dwell = pd.DataFrame(
     df_dwell_rows,
-    columns=["ID", "ROI", "Frames_in_ROI", "Time_in_ROI_s", "Mean_speed_mm_s", "Mean_ang_deg_s"],
+    columns=[
+        "Experiment_ID", "Condition", "Focal_side",
+        "ID", "ROI", "Frames_in_ROI", "Time_in_ROI_s", "Mean_speed_mm_s", "Mean_ang_deg_s"
+    ],
 )
 
 st.subheader("ROI 統計")
@@ -565,6 +575,7 @@ show_rois = st.sidebar.multiselect(
 
 
 # ---------------------- 左右 ROI 分析（只在 Manual Split 模式顯示） ----------------------
+df_pref = pd.DataFrame()
 if roi_mode.startswith("Manual"):
     st.subheader("左右 ROI 分析（Left/Right 1/3）")
     if df_dwell.empty:
@@ -581,22 +592,38 @@ if roi_mode.startswith("Manual"):
             tL = pivot.get(left_name, pd.Series(0.0, index=pivot.index))
             tR = pivot.get(right_name, pd.Series(0.0, index=pivot.index))
             denom = (tL + tR).replace(0, np.nan)
-            pi = (tL - tR) / denom
+
+            # ✅ raw PI: (L-R)/(L+R)
+            pi_raw = (tL - tR) / denom
+
+            # ✅ focal-aligned PI: focal side as positive
+            if focal_side == "Left":
+                pi_focal = pi_raw
+            else:
+                pi_focal = -pi_raw
 
             df_pref = pd.DataFrame(
                 {
+                    "Experiment_ID": exp_id,
+                    "Condition": condition,
+                    "Focal_side": focal_side,  # ✅ you asked: focal_side column
                     "ID": pivot.index,
                     "Time_Left_s": np.round(tL.values, 3),
                     "Time_Right_s": np.round(tR.values, 3),
-                    "PreferenceIndex_(L-R)/(L+R)": np.round(pi.values, 3),
+                    "PI_raw_(L-R)/(L+R)": np.round(pi_raw.values, 3),
+                    "PI_focal_(focal-positive)": np.round(pi_focal.values, 3),
                 }
             )
             st.dataframe(df_pref, use_container_width=True)
 
             TL = float(np.nansum(tL.values))
             TR = float(np.nansum(tR.values))
-            PI_all = (TL - TR) / (TL + TR) if (TL + TR) > 0 else np.nan
-            st.caption(f"All IDs total: Left={TL:.3f}s, Right={TR:.3f}s, PI={PI_all:.3f}")
+            PI_all_raw = (TL - TR) / (TL + TR) if (TL + TR) > 0 else np.nan
+            PI_all_focal = PI_all_raw if focal_side == "Left" else (-PI_all_raw if np.isfinite(PI_all_raw) else np.nan)
+            st.caption(
+                f"All IDs total: Left={TL:.3f}s, Right={TR:.3f}s, "
+                f"PI_raw={PI_all_raw:.3f} | PI_focal={PI_all_focal:.3f} (focal={focal_side})"
+            )
 
 
 # ---------------------- 視覺化 ----------------------
@@ -604,7 +631,7 @@ st.subheader("軌跡圖 (mm)")
 fig, ax = plt.subplots(figsize=(6, 6))
 for i, data in per_id.items():
     xy = data["xy_mm"]
-    ax.plot(xy[:, 0], xy[:, 1], lw=0.7, alpha=0.6)
+    ax.plot(xy[:, 0], xy[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
 
 for roi in ROI_RANGES:
     if roi["name"] in show_rois:
@@ -622,14 +649,14 @@ apply_axis(
 )
 ax.set_xlabel("X (mm)")
 ax.set_ylabel("Y (mm)")
+ax.legend(fontsize=6, loc="best")
 st.pyplot(fig)
-plt.close(fig)
 
 st.subheader("軌跡圖 (px)")
 fig, ax = plt.subplots(figsize=(6, 6))
 for i in ids:
     xy_px = positions_px[i][frame_start: frame_end + 1, :]
-    ax.plot(xy_px[:, 0], xy_px[:, 1], lw=0.7, alpha=0.6)
+    ax.plot(xy_px[:, 0], xy_px[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
 
 for roi in ROI_RANGES:
     if roi["name"] in show_rois:
@@ -639,34 +666,31 @@ for roi in ROI_RANGES:
 
 ax.set_xlabel("X (px)")
 ax.set_ylabel("Y (px)")
+ax.legend(fontsize=6, loc="best")
 st.pyplot(fig)
-plt.close(fig)
 
-# -------- Heatmap (mm) --------
+# ✅ FIX: Heatmap(mm) create a fresh fig/ax
 st.subheader("Heatmap (mm)")
-all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()]) if len(per_id) else np.zeros((0, 2))
-xy_finite = _finite_xy(all_xy_mm_plot)
+all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()])
+
+finite_mask = np.isfinite(all_xy_mm_plot[:, 0]) & np.isfinite(all_xy_mm_plot[:, 1])
+xy_finite = all_xy_mm_plot[finite_mask]
 
 if xy_finite.shape[0] < 2:
-    st.warning("Heatmap(mm) 無有效資料點（可能資料全為 NaN/inf），略過。")
+    st.warning("Heatmap(mm) 無有效資料點（可能 frame/資料不足或全 NaN），略過。")
 else:
     bx = _safe_bins(np.min(xy_finite[:, 0]), np.max(xy_finite[:, 0]), bin_mm)
     by = _safe_bins(np.min(xy_finite[:, 1]), np.max(xy_finite[:, 1]), bin_mm)
 
     H, xedges, yedges = np.histogram2d(xy_finite[:, 0], xy_finite[:, 1], bins=[bx, by])
 
-    fig, ax = plt.subplots(figsize=(6, 6))  # ✅ 新 figure，避免疊圖/多重 colorbar
-
-    vmax = np.percentile(H, 99) if np.any(H > 0) else 1.0
+    fig, ax = plt.subplots(figsize=(6, 6))
     im = ax.imshow(
         H.T,
         origin="lower",
         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
         aspect="auto",
         cmap="hot",
-        vmin=0,
-        vmax=vmax,
-        interpolation="nearest",
     )
     fig.colorbar(im, ax=ax)
 
@@ -680,33 +704,29 @@ else:
     ax.set_xlabel("X (mm)")
     ax.set_ylabel("Y (mm)")
     st.pyplot(fig)
-    plt.close(fig)
 
-# -------- Heatmap (px) --------
+# ✅ FIX: Heatmap(px) create a fresh fig/ax
 st.subheader("Heatmap (px)")
-all_xy_px_plot = np.vstack([positions_px[i][frame_start: frame_end + 1, :] for i in ids]) if len(ids) else np.zeros((0, 2))
-xy_finite = _finite_xy(all_xy_px_plot)
+all_xy_px_plot = np.vstack([positions_px[i][frame_start: frame_end + 1, :] for i in ids])
+
+finite_mask = np.isfinite(all_xy_px_plot[:, 0]) & np.isfinite(all_xy_px_plot[:, 1])
+xy_finite = all_xy_px_plot[finite_mask]
 
 if xy_finite.shape[0] < 2:
-    st.warning("Heatmap(px) 無有效資料點（可能資料全為 NaN/inf），略過。")
+    st.warning("Heatmap(px) 無有效資料點（可能 frame/資料不足或全 NaN），略過。")
 else:
     bx = _safe_bins(np.min(xy_finite[:, 0]), np.max(xy_finite[:, 0]), bin_px)
     by = _safe_bins(np.min(xy_finite[:, 1]), np.max(xy_finite[:, 1]), bin_px)
 
     H, xedges, yedges = np.histogram2d(xy_finite[:, 0], xy_finite[:, 1], bins=[bx, by])
 
-    fig, ax = plt.subplots(figsize=(6, 6))  # ✅ 新 figure，避免疊圖/多重 colorbar
-
-    vmax = np.percentile(H, 99) if np.any(H > 0) else 1.0
+    fig, ax = plt.subplots(figsize=(6, 6))
     im = ax.imshow(
         H.T,
         origin="lower",
         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
         aspect="auto",
         cmap="hot",
-        vmin=0,
-        vmax=vmax,
-        interpolation="nearest",
     )
     fig.colorbar(im, ax=ax)
 
@@ -719,7 +739,6 @@ else:
     ax.set_xlabel("X (px)")
     ax.set_ylabel("Y (px)")
     st.pyplot(fig)
-    plt.close(fig)
 
 # 速度與角速度
 st.subheader("速度與角速度曲線")
@@ -732,17 +751,32 @@ for i, data in per_id.items():
     ax[1].set_xlabel("Frame")
     fig.suptitle(f"ID {i}")
     st.pyplot(fig)
-    plt.close(fig)
 
 # ---------------------- 匯出 Excel/PDF/ZIP ----------------------
 st.subheader("匯出結果")
 
 df_roi_ranges = pd.DataFrame(
-    [{"ROI": r["name"], "x1_px": r["rect"][0], "y1_px": r["rect"][1], "x2_px": r["rect"][2], "y2_px": r["rect"][3]} for r in ROI_RANGES]
+    [
+        {
+            "Experiment_ID": exp_id,
+            "Condition": condition,
+            "Focal_side": focal_side,
+            "ROI": r["name"],
+            "x1_px": r["rect"][0],
+            "y1_px": r["rect"][1],
+            "x2_px": r["rect"][2],
+            "y2_px": r["rect"][3],
+        }
+        for r in ROI_RANGES
+    ]
 )
+
 df_meta = pd.DataFrame(
     [
         {
+            "Experiment_ID": exp_id,
+            "Condition": condition,
+            "Focal_side": focal_side,
             "px_to_mm": px_to_mm,
             "fps": fps,
             "frame_start": frame_start,
@@ -753,11 +787,23 @@ df_meta = pd.DataFrame(
     ]
 )
 
+# Ensure df_pref exists even in Auto mode
+if df_pref is None or not isinstance(df_pref, pd.DataFrame) or df_pref.empty:
+    df_pref_export = pd.DataFrame(
+        columns=[
+            "Experiment_ID", "Condition", "Focal_side", "ID",
+            "Time_Left_s", "Time_Right_s", "PI_raw_(L-R)/(L+R)", "PI_focal_(focal-positive)"
+        ]
+    )
+else:
+    df_pref_export = df_pref.copy()
+
 if st.button("⬇️ 匯出 Excel"):
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="xlsxwriter") as writer:
         df_global.to_excel(writer, sheet_name="Global", index=False)
         df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
+        df_pref_export.to_excel(writer, sheet_name="PreferenceIndex", index=False)
         df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
         df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
     excel_buf.seek(0)
@@ -771,41 +817,21 @@ if st.button("⬇️ 匯出 Excel"):
 if st.button("⬇️ 匯出 PDF"):
     pdf_buf = io.BytesIO()
     with PdfPages(pdf_buf) as pdf:
-        # Global
-        fig, ax = plt.subplots(figsize=(5, 2))
-        ax.axis("off")
-        tbl = ax.table(cellText=df_global.values, colLabels=df_global.columns, loc="center")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8)
-        pdf.savefig(fig)
-        plt.close(fig)
+        def _pdf_table(df, title, fontsize=7, fig_w=8, fig_h=3):
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            ax.axis("off")
+            ax.set_title(title)
+            tbl = ax.table(cellText=df.values, colLabels=df.columns, loc="center")
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(fontsize)
+            pdf.savefig(fig)
+            plt.close(fig)
 
-        # ROI Summary
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.axis("off")
-        tbl = ax.table(cellText=df_dwell.values, colLabels=df_dwell.columns, loc="center")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(6)
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        # ROI Ranges
-        fig, ax = plt.subplots(figsize=(8, 3))
-        ax.axis("off")
-        tbl = ax.table(cellText=df_roi_ranges.values, colLabels=df_roi_ranges.columns, loc="center")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8)
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        # Meta Info
-        fig, ax = plt.subplots(figsize=(6, 2))
-        ax.axis("off")
-        tbl = ax.table(cellText=df_meta.values, colLabels=df_meta.columns, loc="center")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8)
-        pdf.savefig(fig)
-        plt.close(fig)
+        _pdf_table(df_global, "Global", fontsize=8, fig_w=8, fig_h=2)
+        _pdf_table(df_dwell, "ROI_Summary", fontsize=6, fig_w=10, fig_h=4)
+        _pdf_table(df_pref_export, "PreferenceIndex", fontsize=7, fig_w=10, fig_h=3)
+        _pdf_table(df_roi_ranges, "ROI_Ranges", fontsize=7, fig_w=10, fig_h=3)
+        _pdf_table(df_meta, "Meta_Info", fontsize=8, fig_w=8, fig_h=2)
 
     pdf_buf.seek(0)
     st.download_button("下載 PDF", data=pdf_buf, file_name="all_results.pdf", mime="application/pdf")
@@ -818,6 +844,7 @@ if st.button("⬇️ 匯出 ZIP"):
         with pd.ExcelWriter(excel_bytes, engine="xlsxwriter") as writer:
             df_global.to_excel(writer, sheet_name="Global", index=False)
             df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
+            df_pref_export.to_excel(writer, sheet_name="PreferenceIndex", index=False)
             df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
             df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
         excel_bytes.seek(0)
@@ -826,6 +853,7 @@ if st.button("⬇️ 匯出 ZIP"):
         # CSV
         zf.writestr("global_summary.csv", df_global.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("roi_summary.csv", df_dwell.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("preference_index.csv", df_pref_export.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("roi_ranges.csv", df_roi_ranges.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("meta_info.csv", df_meta.to_csv(index=False).encode("utf-8-sig"))
 
