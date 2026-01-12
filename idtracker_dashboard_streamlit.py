@@ -607,15 +607,41 @@ ax.legend(fontsize=6, loc="best")
 st.pyplot(fig)
 
 st.subheader("Heatmap (mm)")
-all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()]) if len(per_id) else np.zeros((0, 2))
-fig, ax = plt.subplots(figsize=(6, 6))
-if all_xy_mm_plot.shape[0] < 2:
-    st.warning("Heatmap(mm) 資料不足（點數太少），略過。")
-else:
-    bx = _safe_bins(np.nanmin(all_xy_mm_plot[:, 0]), np.nanmax(all_xy_mm_plot[:, 0]), bin_mm)
-    by = _safe_bins(np.nanmin(all_xy_mm_plot[:, 1]), np.nanmax(all_xy_mm_plot[:, 1]), bin_mm)
+all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()])
 
-    H, xedges, yedges = np.histogram2d(all_xy_mm_plot[:, 0], all_xy_mm_plot[:, 1], bins=[bx, by])
+# ✅ 只保留 finite 點
+finite_mask = np.isfinite(all_xy_mm_plot[:, 0]) & np.isfinite(all_xy_mm_plot[:, 1])
+xy_finite = all_xy_mm_plot[finite_mask]
+
+if xy_finite.shape[0] < 2:
+    st.warning("Heatmap(mm) 無有效資料點（可能 ROI / frame 設定後全為 NaN），略過。")
+else:
+    bx = _safe_bins(
+        np.min(xy_finite[:, 0]),
+        np.max(xy_finite[:, 0]),
+        bin_mm,
+    )
+    by = _safe_bins(
+        np.min(xy_finite[:, 1]),
+        np.max(xy_finite[:, 1]),
+        bin_mm,
+    )
+
+    H, xedges, yedges = np.histogram2d(
+        xy_finite[:, 0],
+        xy_finite[:, 1],
+        bins=[bx, by],
+    )
+
+    im = ax.imshow(
+        H.T,
+        origin="lower",
+        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+        aspect="auto",
+        cmap="hot",
+    )
+    fig.colorbar(im, ax=ax)
+
     im = ax.imshow(
         H.T,
         origin="lower",
