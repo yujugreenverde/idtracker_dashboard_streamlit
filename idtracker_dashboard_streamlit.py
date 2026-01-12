@@ -1,10 +1,10 @@
 # idtracker_dashboard_streamlit.py
-# 覆蓋版（2026-01-12 / FIX v2）
+# 覆蓋版（2026-01-12 / FIX v2.1）
 # 修正：
 # 1) st.image 參數相容：use_container_width / use_column_width 自動 fallback
-# 2) drawable-canvas 背景圖：優先用 background_image_url(data URL) 避免 image_to_url 崩潰
-# 3) px_to_mm/fps 先定義，量測區塊可直接用
-# 4) st_canvas 參數降到最保守，避免版本 TypeError
+# 2) 點選座標：優先用 streamlit-image-coordinates（避免 canvas 與底圖錯位/不顯示）
+# 3) 若 streamlit-image-coordinates 不存在 → fallback 到 drawable-canvas（盡量穩定）
+# 4) 避免 StreamlitAPIException：不直接改 widget 綁定的 session_state（roi_mode/show_rois），改用 *_pending + rerun
 #
 # requirements.txt 建議：
 # streamlit
@@ -15,9 +15,11 @@
 # xlsxwriter
 # Pillow
 # streamlit-drawable-canvas==0.9.3
+# streamlit-image-coordinates==0.1.6
 
 import os
 import io
+import math
 import tempfile
 import zipfile
 import base64
@@ -34,11 +36,19 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
 from PIL import Image
 
+# Optional: drawable canvas
 try:
     from streamlit_drawable_canvas import st_canvas
     _HAS_CANVAS = True
 except Exception:
     _HAS_CANVAS = False
+
+# Optional: streamlit-image-coordinates (preferred)
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    _HAS_IMG_COORD = True
+except Exception:
+    _HAS_IMG_COORD = False
 
 
 # ---------------------- 相容小工具 ----------------------
@@ -114,9 +124,18 @@ def _safe_bins(vmin, vmax, bin_size, max_bins=800):
 st.set_page_config(layout="wide")
 st.title("🐭 idtracker.ai Dashboard")
 
+# ---- apply pending widget state BEFORE widgets are created ----
+# (避免 StreamlitAPIException：不能在 widget 建立後改它綁定的 key)
+if "roi_mode_pending" in st.session_state:
+    st.session_state["roi_mode"] = st.session_state.pop("roi_mode_pending")
+
+if "show_rois_pending" in st.session_state:
+    st.session_state["show_rois"] = st.session_state.pop("show_rois_pending")
+
 uploaded = st.file_uploader("請上傳軌跡檔 (.h5 / .hdf5 / .npz)", type=["h5", "hdf5", "npz"])
 
-# Sidebar 先定義（量測會用到 px_to_mm）
+
+# ---------------------- Sidebar 先定義（量測會用到 px_to_mm） ----------------------
 st.sidebar.header("參數設定")
 fps = st.sidebar.number_input("FPS", value=30.0, step=1.0)
 
@@ -149,8 +168,7 @@ y_tick_mm = st.sidebar.number_input("Ytick (mm)", value=0.0, step=0.5)
 
 
 # ---------------------- PNG 量測工具（主頁） ----------------------
-from streamlit_image_coordinates import streamlit_image_coordinates
-
+st.markdown("---")
 st.subheader("🧰 ROI/座標量測（PNG→點選→px/mm）")
 
 if "roi_pts" not in st.session_state:
@@ -168,15 +186,57 @@ if img_file_main is not None:
     img0 = resize_if_too_large(img0, max_side=1400)
     w0, h0 = img0.size
 
-    disp_w = st.slider("顯示寬度 (px)", 500, min(1200, w0), min(900, w0), 50)
+    disp_w = st.slider("顯示寬度 (px)", 500, min(1400, w0), min(900, w0), 50, key="roi_disp_w")
     scale = disp_w / float(w0)
     disp_h = int(h0 * scale)
 
     img_disp = img0.resize((disp_w, disp_h))
 
-    # ✅ 這行會「顯示圖」且可點，點到哪裡就回傳座標
-    click = streamlit_image_coordinates(img_disp, key="img_coord")
+    # ---- Prefer streamlit-image-coordinates (best alignment) ----
+    click = None
+    if _HAS_IMG_COORD:
+        click = streamlit_image_coordinates(img_disp, key="img_coord")
+    else:
+        st.warning("找不到 streamlit-image-coordinates，改用 drawable-canvas fallback（若你仍遇到底圖不顯示/錯位，請把 requirements.txt 加上 streamlit-image-coordinates）。")
 
+        if not _HAS_CANVAS:
+            st.error("同時缺少 streamlit-image-coordinates 與 streamlit-drawable-canvas，無法點選量測。")
+        else:
+            # drawable-canvas fallback with data-url background
+            bg_url = pil_to_data_url(img_disp, fmt="PNG")
+            # 盡量用最保守參數，避免版本 TypeError
+            try:
+                canvas = st_canvas(
+                    background_color="white",
+                    background_image_url=bg_url,
+                    update_streamlit=True,
+                    height=disp_h,
+                    width=disp_w,
+                    drawing_mode="point",
+                    key="roi_canvas_fallback",
+                )
+            except TypeError:
+                canvas = st_canvas(
+                    background_color="white",
+                    background_image=img_disp,
+                    update_streamlit=True,
+                    height=disp_h,
+                    width=disp_w,
+                    drawing_mode="point",
+                    key="roi_canvas_fallback",
+                )
+
+            # 把 canvas 點位轉成 click 格式
+            if canvas is not None and canvas.json_data is not None:
+                objs = canvas.json_data.get("objects", [])
+                if objs:
+                    last = objs[-1]
+                    x = last.get("left", last.get("x", None))
+                    y = last.get("top", last.get("y", None))
+                    if x is not None and y is not None:
+                        click = {"x": float(x), "y": float(y)}
+
+    # ---- Handle click ----
     if click is not None:
         x_disp, y_disp = float(click["x"]), float(click["y"])
 
@@ -219,15 +279,17 @@ if img_file_main is not None:
         st.markdown("**ROI_0 (mm)**")
         st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
 
+        # ✅ 重要：不要直接改 roi_mode（它被 radio 綁 key="roi_mode"）
         if st.button("✅ Apply ROI_0 to Manual ROI inputs", key="apply_roi0_main"):
             st.session_state["roi0_x1"] = float(rx1)
             st.session_state["roi0_y1"] = float(ry1)
             st.session_state["roi0_x2"] = float(rx2)
             st.session_state["roi0_y2"] = float(ry2)
-            st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
-            st.session_state["show_rois"] = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
-            st.rerun()
 
+            # pending -> rerun -> 在 widget 建立前套用
+            st.session_state["roi_mode_pending"] = "Manual ROI_0 + Split Left/Right 1/3"
+            st.session_state["show_rois_pending"] = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
+            st.rerun()
 
 
 # ---------------------- 載入軌跡 ----------------------
@@ -321,7 +383,7 @@ if st.sidebar.button("⬅️ 用量測兩點填入 ROI_0", key="btn_fill_roi0"):
         st.sidebar.warning("請先在 PNG 上連點兩次（左上→右下）以定義 ROI_0。")
 
 
-# ---------------------- ROI 產生 / 後續分析（以下維持你原本邏輯） ----------------------
+# ---------------------- ROI 產生 / 後續分析 ----------------------
 if uploaded is None:
     st.info("請上傳軌跡檔以繼續")
     st.stop()
@@ -357,7 +419,358 @@ else:
 
 st.sidebar.caption(f"ROI count = {len(ROI_RANGES)}")
 
-# --------- 以下：你原本的 per_id / df_global / df_dwell / 視覺化 / 匯出 完整照貼即可 ---------
-# （為了不讓回覆爆長，我這裡不重複貼你後半段；你把你原本 FIX 檔案中
-#  `# ---------------------- per-ID 計算 ----------------------` 之後的內容
-#  原封不動接在這行下面即可。）
+
+# ---------------------- per-ID 計算 ----------------------
+def compute_speed_mm_per_s(xy_mm, fps):
+    diff = np.diff(xy_mm, axis=0)
+    dist = np.linalg.norm(diff, axis=1)
+    return np.concatenate([[np.nan], dist * fps])
+
+
+def compute_ang_vel_deg_per_s(xy_mm, fps, eps=1e-6):
+    v = np.diff(xy_mm, axis=0) * fps
+    ang_vel = np.full(len(xy_mm), np.nan)
+    if len(v) >= 2:
+        dot = np.sum(v[1:] * v[:-1], axis=1)
+        cross = v[1:, 0] * v[:-1, 1] - v[1:, 1] * v[:-1, 0]
+        norm = np.linalg.norm(v[1:], axis=1) * np.linalg.norm(v[:-1], axis=1)
+        norm = np.where(norm < eps, eps, norm)
+        dtheta = np.arctan2(cross, dot)
+        av = dtheta * fps * (180 / np.pi)
+        av = (av + 180) % 360 - 180
+        ang_vel[2:] = av
+    return ang_vel
+
+
+per_id = {}
+for i in ids:
+    xy_px = positions_px[i][frame_start: frame_end + 1, :]
+    xy_mm = xy_px * px_to_mm
+    spd = compute_speed_mm_per_s(xy_mm, fps)
+    ang = compute_ang_vel_deg_per_s(xy_mm, fps)
+    per_id[i] = {"xy_mm": xy_mm, "speed": spd, "angvel": ang}
+
+
+# ---------------------- Global Summary ----------------------
+all_dist = []
+for data in per_id.values():
+    xy = data["xy_mm"]
+    if xy.shape[0] >= 2:
+        steps = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+        all_dist.append(np.nansum(steps))
+
+global_distance_mm = float(np.nansum(all_dist))
+global_mean_speed = float(np.nanmean(np.concatenate([d["speed"] for d in per_id.values()]))) if len(per_id) else np.nan
+global_mean_ang = float(np.nanmean(np.concatenate([d["angvel"] for d in per_id.values()]))) if len(per_id) else np.nan
+
+df_global = pd.DataFrame(
+    [
+        {
+            "Total_distance_mm": round(global_distance_mm, 3),
+            "Mean_speed_mm_s": round(global_mean_speed, 3) if np.isfinite(global_mean_speed) else np.nan,
+            "Mean_ang_deg_s": round(global_mean_ang, 3) if np.isfinite(global_mean_ang) else np.nan,
+        }
+    ]
+)
+
+st.subheader("整體統計")
+st.dataframe(df_global, use_container_width=True)
+
+
+# ---------------------- ROI 統計 ----------------------
+def in_rect(xy_px, rect):
+    x1, y1, x2, y2 = rect
+    return (xy_px[:, 0] >= x1) & (xy_px[:, 0] <= x2) & (xy_px[:, 1] >= y1) & (xy_px[:, 1] <= y2)
+
+
+df_dwell_rows = []
+for i in ids:
+    xy_px = positions_px[i][frame_start: frame_end + 1, :]
+    spd = per_id[i]["speed"]
+    ang = per_id[i]["angvel"]
+
+    for roi in ROI_RANGES:
+        name = roi["name"]
+        mask = in_rect(xy_px, roi["rect"])  # ROI 判定用 px
+        frames_in = int(np.count_nonzero(mask))
+        mean_spd = float(np.nanmean(np.where(mask, spd, np.nan)))
+        mean_ang = float(np.nanmean(np.where(mask, ang, np.nan)))
+
+        df_dwell_rows.append(
+            {
+                "ID": i,
+                "ROI": name,
+                "Frames_in_ROI": frames_in,
+                "Time_in_ROI_s": round(frames_in / fps, 3),
+                "Mean_speed_mm_s": round(mean_spd, 3) if np.isfinite(mean_spd) else np.nan,
+                "Mean_ang_deg_s": round(mean_ang, 3) if np.isfinite(mean_ang) else np.nan,
+            }
+        )
+
+df_dwell = pd.DataFrame(
+    df_dwell_rows,
+    columns=["ID", "ROI", "Frames_in_ROI", "Time_in_ROI_s", "Mean_speed_mm_s", "Mean_ang_deg_s"],
+)
+
+st.subheader("ROI 統計")
+st.dataframe(df_dwell, use_container_width=True)
+
+
+# ---------------------- ROI 顯示選項 ----------------------
+# (show_rois 也是 widget key，若你要程式控制，請用 show_rois_pending)
+roi_names = [r["name"] for r in ROI_RANGES]
+default_show = roi_names if len(roi_names) > 0 else []
+show_rois = st.sidebar.multiselect(
+    "要在圖上顯示哪些 ROI？",
+    options=roi_names,
+    default=st.session_state.get("show_rois", default_show),
+    key="show_rois",
+)
+
+
+# ---------------------- 左右 ROI 分析（只在 Manual Split 模式顯示） ----------------------
+if roi_mode.startswith("Manual"):
+    st.subheader("左右 ROI 分析（Left/Right 1/3）")
+    if df_dwell.empty:
+        st.warning("df_dwell 目前為空（可能 ROI_0 尚未有效、或 frame/資料不足），無法計算左右偏好。")
+    else:
+        roi_set = set(df_dwell["ROI"].dropna().unique().tolist())
+        left_name = "ROI_LEFT_1_3" if "ROI_LEFT_1_3" in roi_set else None
+        right_name = "ROI_RIGHT_1_3" if "ROI_RIGHT_1_3" in roi_set else None
+
+        if left_name is None or right_name is None:
+            st.warning("找不到 ROI_LEFT_1_3 / ROI_RIGHT_1_3，請確認 ROI_0 有效且已產生分割 ROI。")
+        else:
+            pivot = df_dwell.pivot_table(index="ID", columns="ROI", values="Time_in_ROI_s", aggfunc="sum").fillna(0.0)
+            tL = pivot.get(left_name, pd.Series(0.0, index=pivot.index))
+            tR = pivot.get(right_name, pd.Series(0.0, index=pivot.index))
+            denom = (tL + tR).replace(0, np.nan)
+            pi = (tL - tR) / denom
+
+            df_pref = pd.DataFrame(
+                {
+                    "ID": pivot.index,
+                    "Time_Left_s": np.round(tL.values, 3),
+                    "Time_Right_s": np.round(tR.values, 3),
+                    "PreferenceIndex_(L-R)/(L+R)": np.round(pi.values, 3),
+                }
+            )
+            st.dataframe(df_pref, use_container_width=True)
+
+            TL = float(np.nansum(tL.values))
+            TR = float(np.nansum(tR.values))
+            PI_all = (TL - TR) / (TL + TR) if (TL + TR) > 0 else np.nan
+            st.caption(f"All IDs total: Left={TL:.3f}s, Right={TR:.3f}s, PI={PI_all:.3f}")
+
+
+# ---------------------- 視覺化 ----------------------
+st.subheader("軌跡圖 (mm)")
+fig, ax = plt.subplots(figsize=(6, 6))
+for i, data in per_id.items():
+    xy = data["xy_mm"]
+    ax.plot(xy[:, 0], xy[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
+
+for roi in ROI_RANGES:
+    if roi["name"] in show_rois:
+        x1p, y1p, x2p, y2p = roi["rect"]
+        x1m, y1m, x2m, y2m = x1p * px_to_mm, y1p * px_to_mm, x2p * px_to_mm, y2p * px_to_mm
+        rect = Rectangle((x1m, y1m), x2m - x1m, y2m - y1m, fill=False, lw=1.2, alpha=0.9)
+        ax.add_patch(rect)
+
+apply_axis(
+    ax,
+    xlim=_lim_tuple(x_min_mm, x_max_mm),
+    ylim=_lim_tuple(y_min_mm, y_max_mm),
+    xtick=_tick_val(x_tick_mm),
+    ytick=_tick_val(y_tick_mm),
+)
+ax.set_xlabel("X (mm)")
+ax.set_ylabel("Y (mm)")
+ax.legend(fontsize=6, loc="best")
+st.pyplot(fig)
+
+st.subheader("軌跡圖 (px)")
+fig, ax = plt.subplots(figsize=(6, 6))
+for i in ids:
+    xy_px = positions_px[i][frame_start: frame_end + 1, :]
+    ax.plot(xy_px[:, 0], xy_px[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
+
+for roi in ROI_RANGES:
+    if roi["name"] in show_rois:
+        x1p, y1p, x2p, y2p = roi["rect"]
+        rect = Rectangle((x1p, y1p), x2p - x1p, y2p - y1p, fill=False, lw=1.2, alpha=0.9)
+        ax.add_patch(rect)
+
+ax.set_xlabel("X (px)")
+ax.set_ylabel("Y (px)")
+ax.legend(fontsize=6, loc="best")
+st.pyplot(fig)
+
+st.subheader("Heatmap (mm)")
+all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()]) if len(per_id) else np.zeros((0, 2))
+fig, ax = plt.subplots(figsize=(6, 6))
+if all_xy_mm_plot.shape[0] < 2:
+    st.warning("Heatmap(mm) 資料不足（點數太少），略過。")
+else:
+    bx = _safe_bins(np.nanmin(all_xy_mm_plot[:, 0]), np.nanmax(all_xy_mm_plot[:, 0]), bin_mm)
+    by = _safe_bins(np.nanmin(all_xy_mm_plot[:, 1]), np.nanmax(all_xy_mm_plot[:, 1]), bin_mm)
+
+    H, xedges, yedges = np.histogram2d(all_xy_mm_plot[:, 0], all_xy_mm_plot[:, 1], bins=[bx, by])
+    im = ax.imshow(
+        H.T,
+        origin="lower",
+        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+        aspect="auto",
+        cmap="hot",
+    )
+    fig.colorbar(im, ax=ax)
+
+    for roi in ROI_RANGES:
+        if roi["name"] in show_rois:
+            x1p, y1p, x2p, y2p = roi["rect"]
+            x1m, y1m, x2m, y2m = x1p * px_to_mm, y1p * px_to_mm, x2p * px_to_mm, y2p * px_to_mm
+            rect = Rectangle((x1m, y1m), x2m - x1m, y2m - y1m, fill=False, lw=1.2, alpha=0.9, color="cyan")
+            ax.add_patch(rect)
+
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    st.pyplot(fig)
+
+st.subheader("Heatmap (px)")
+all_xy_px_plot = np.vstack([positions_px[i][frame_start: frame_end + 1, :] for i in ids]) if len(ids) else np.zeros((0, 2))
+fig, ax = plt.subplots(figsize=(6, 6))
+if all_xy_px_plot.shape[0] < 2:
+    st.warning("Heatmap(px) 資料不足（點數太少），略過。")
+else:
+    bx = _safe_bins(np.nanmin(all_xy_px_plot[:, 0]), np.nanmax(all_xy_px_plot[:, 0]), bin_px)
+    by = _safe_bins(np.nanmin(all_xy_px_plot[:, 1]), np.nanmax(all_xy_px_plot[:, 1]), bin_px)
+
+    H, xedges, yedges = np.histogram2d(all_xy_px_plot[:, 0], all_xy_px_plot[:, 1], bins=[bx, by])
+    im = ax.imshow(
+        H.T,
+        origin="lower",
+        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+        aspect="auto",
+        cmap="hot",
+    )
+    fig.colorbar(im, ax=ax)
+
+    for roi in ROI_RANGES:
+        if roi["name"] in show_rois:
+            x1p, y1p, x2p, y2p = roi["rect"]
+            rect = Rectangle((x1p, y1p), x2p - x1p, y2p - y1p, fill=False, lw=1.2, alpha=0.9, color="cyan")
+            ax.add_patch(rect)
+
+    ax.set_xlabel("X (px)")
+    ax.set_ylabel("Y (px)")
+    st.pyplot(fig)
+
+# 速度與角速度
+st.subheader("速度與角速度曲線")
+for i, data in per_id.items():
+    fig, ax = plt.subplots(2, 1, figsize=(8, 4), sharex=True)
+    ax[0].plot(data["speed"], lw=0.8)
+    ax[0].set_ylabel("Speed (mm/s)")
+    ax[1].plot(data["angvel"], lw=0.8)
+    ax[1].set_ylabel("Ang vel (deg/s)")
+    ax[1].set_xlabel("Frame")
+    fig.suptitle(f"ID {i}")
+    st.pyplot(fig)
+
+# ---------------------- 匯出 Excel/PDF/ZIP ----------------------
+st.subheader("匯出結果")
+
+df_roi_ranges = pd.DataFrame(
+    [{"ROI": r["name"], "x1_px": r["rect"][0], "y1_px": r["rect"][1], "x2_px": r["rect"][2], "y2_px": r["rect"][3]} for r in ROI_RANGES]
+)
+df_meta = pd.DataFrame(
+    [
+        {
+            "px_to_mm": px_to_mm,
+            "fps": fps,
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "frame_count": frame_end - frame_start + 1,
+            "roi_mode": roi_mode,
+        }
+    ]
+)
+
+if st.button("⬇️ 匯出 Excel"):
+    excel_buf = io.BytesIO()
+    with pd.ExcelWriter(excel_buf, engine="xlsxwriter") as writer:
+        df_global.to_excel(writer, sheet_name="Global", index=False)
+        df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
+        df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
+        df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
+    excel_buf.seek(0)
+    st.download_button(
+        "下載 Excel",
+        data=excel_buf,
+        file_name="all_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+if st.button("⬇️ 匯出 PDF"):
+    pdf_buf = io.BytesIO()
+    with PdfPages(pdf_buf) as pdf:
+        # Global
+        fig, ax = plt.subplots(figsize=(5, 2))
+        ax.axis("off")
+        tbl = ax.table(cellText=df_global.values, colLabels=df_global.columns, loc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ROI Summary
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.axis("off")
+        tbl = ax.table(cellText=df_dwell.values, colLabels=df_dwell.columns, loc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(6)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ROI Ranges
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.axis("off")
+        tbl = ax.table(cellText=df_roi_ranges.values, colLabels=df_roi_ranges.columns, loc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Meta Info
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis("off")
+        tbl = ax.table(cellText=df_meta.values, colLabels=df_meta.columns, loc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    pdf_buf.seek(0)
+    st.download_button("下載 PDF", data=pdf_buf, file_name="all_results.pdf", mime="application/pdf")
+
+if st.button("⬇️ 匯出 ZIP"):
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        # Excel
+        excel_bytes = io.BytesIO()
+        with pd.ExcelWriter(excel_bytes, engine="xlsxwriter") as writer:
+            df_global.to_excel(writer, sheet_name="Global", index=False)
+            df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
+            df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
+            df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
+        excel_bytes.seek(0)
+        zf.writestr("all_results.xlsx", excel_bytes.read())
+
+        # CSV
+        zf.writestr("global_summary.csv", df_global.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("roi_summary.csv", df_dwell.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("roi_ranges.csv", df_roi_ranges.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("meta_info.csv", df_meta.to_csv(index=False).encode("utf-8-sig"))
+
+    zip_buf.seek(0)
+    st.download_button("下載 ZIP", data=zip_buf, file_name="all_results_bundle.zip", mime="application/zip")
