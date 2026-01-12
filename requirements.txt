@@ -6,3 +6,4 @@ matplotlib
 h5py
 pandas
 numpy
+streamlit-image-coordinates
