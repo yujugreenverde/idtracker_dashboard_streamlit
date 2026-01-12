@@ -149,8 +149,7 @@ y_tick_mm = st.sidebar.number_input("Ytick (mm)", value=0.0, step=0.5)
 
 
 # ---------------------- PNG 量測工具（主頁） ----------------------
-st.markdown("---")
-st.subheader("🧰 from streamlit_image_coordinates import streamlit_image_coordinates
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.subheader("🧰 ROI/座標量測（PNG→點選→px/mm）")
 
