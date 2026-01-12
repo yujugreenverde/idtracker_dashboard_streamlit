@@ -150,145 +150,84 @@ y_tick_mm = st.sidebar.number_input("Ytick (mm)", value=0.0, step=0.5)
 
 # ---------------------- PNG 量測工具（主頁） ----------------------
 st.markdown("---")
+st.subheader("🧰 from streamlit_image_coordinates import streamlit_image_coordinates
+
 st.subheader("🧰 ROI/座標量測（PNG→點選→px/mm）")
 
 if "roi_pts" not in st.session_state:
     st.session_state.roi_pts = []  # 只保留兩點
 
-if not _HAS_CANVAS:
-    st.error("缺少 streamlit-drawable-canvas。請確認 requirements.txt 已安裝 streamlit-drawable-canvas==0.9.3")
-else:
-    img_file_main = st.file_uploader(
-        "上傳 frame 圖片 (PNG/JPG) 以點選量測",
-        type=["png", "jpg", "jpeg"],
-        key="roi_measure_img_main",
-    )
-    st.caption("建議：Fiji 抽一張 frame 存 PNG，上傳後點一下記錄座標；連點兩次可定義 ROI_0（左上→右下）。")
+img_file_main = st.file_uploader(
+    "上傳 frame 圖片 (PNG/JPG) 以點選量測",
+    type=["png", "jpg", "jpeg"],
+    key="roi_measure_img_main",
+)
+st.caption("建議：Fiji 抽一張 frame 存 PNG，上傳後點一下記錄座標；連點兩次可定義 ROI_0（左上→右下）。")
 
-    if img_file_main is not None:
-        img0 = Image.open(img_file_main).convert("RGB")
-        img0 = resize_if_too_large(img0, max_side=1400)
-        w0, h0 = img0.size
+if img_file_main is not None:
+    img0 = Image.open(img_file_main).convert("RGB")
+    img0 = resize_if_too_large(img0, max_side=1400)
+    w0, h0 = img0.size
 
-        disp_w = st.slider("顯示寬度 (px)", 500, min(1200, w0), min(900, w0), 50)
-        scale = disp_w / float(w0)
-        disp_h = int(h0 * scale)
+    disp_w = st.slider("顯示寬度 (px)", 500, min(1200, w0), min(900, w0), 50)
+    scale = disp_w / float(w0)
+    disp_h = int(h0 * scale)
 
-        img_disp = img0.resize((disp_w, disp_h))
+    img_disp = img0.resize((disp_w, disp_h))
 
-        # ✅ 不要用 st.image 顯示 img_disp（會造成你點到 st.image 而不是 canvas）
-        # st_image_compat(img_disp, caption=f"Debug: image ok ({disp_w}×{disp_h})")  # ← 刪掉
+    # ✅ 這行會「顯示圖」且可點，點到哪裡就回傳座標
+    click = streamlit_image_coordinates(img_disp, key="img_coord")
 
-        bg_url = pil_to_data_url(img_disp, fmt="PNG")
+    if click is not None:
+        x_disp, y_disp = float(click["x"]), float(click["y"])
 
-        # ✅ 只保留一個「可見 + 可點」的元件：canvas
-        try:
-            canvas = st_canvas(
-                background_color="white",
-                background_image_url=bg_url,
-                update_streamlit=True,
-                height=disp_h,
-                width=disp_w,
-                drawing_mode="point",
-                stroke_width=2,
-                stroke_color="rgba(0,255,255,1)",
-                fill_color="rgba(255,0,0,0)",
-                key="roi_measure_canvas_main",
-            )
-        except TypeError:
-            canvas = st_canvas(
-                background_color="white",
-                background_image=img_disp,
-                update_streamlit=True,
-                height=disp_h,
-                width=disp_w,
-                drawing_mode="point",
-                stroke_width=2,
-                stroke_color="rgba(0,255,255,1)",
-                fill_color="rgba(255,0,0,0)",
-                key="roi_measure_canvas_main",
-            )
+        # 轉回原圖座標
+        x_px = x_disp / scale
+        y_px = y_disp / scale
 
-        def _get_last_point_px(canvas_json):
-            if canvas_json is None:
-                return None
-            objs = canvas_json.get("objects", [])
-            if not objs:
-                return None
-            last = objs[-1]
-            x = last.get("left", None)
-            y = last.get("top", None)
-            if x is None or y is None:
-                x = last.get("x", None)
-                y = last.get("y", None)
-            if x is None or y is None:
-                return None
-            try:
-                return float(x), float(y)
-            except Exception:
-                return None
+        # mm
+        x_mm = x_px * px_to_mm
+        y_mm = y_px * px_to_mm
 
-        n_obj = 0 if canvas.json_data is None else len(canvas.json_data.get("objects", []))
-        st.write("objects =", n_obj)
+        st.success(f"點選（原圖）x={x_px:.1f}px, y={y_px:.1f}px ｜ x={x_mm:.2f}mm, y={y_mm:.2f}mm")
 
-        pt = _get_last_point_px(canvas.json_data)
+        # 去重 + 只保留兩點
+        pts = st.session_state.roi_pts
+        if len(pts) == 0 or (abs(pts[-1][0] - x_px) > 1 or abs(pts[-1][1] - y_px) > 1):
+            pts.append((x_px, y_px))
+            st.session_state.roi_pts = pts[:2]
 
-        if pt is not None:
-            x_disp, y_disp = pt
-            x_px = x_disp / scale
-            y_px = y_disp / scale
-            x_mm = x_px * px_to_mm
-            y_mm = y_px * px_to_mm
-            st.success(f"點選（原圖）x={x_px:.1f}px, y={y_px:.1f}px ｜ x={x_mm:.2f}mm, y={y_mm:.2f}mm")
+    colA, colB = st.columns([1, 2])
+    with colA:
+        if st.button("清空點位", key="roi_clear_pts_main"):
+            st.session_state.roi_pts = []
+            st.rerun()
+    with colB:
+        st.write(f"已記錄點數：{len(st.session_state.roi_pts)}")
+        if len(st.session_state.roi_pts) > 0:
+            st.write("Points (original px):", st.session_state.roi_pts)
 
-            pts = st.session_state.roi_pts
-            if len(pts) == 0 or (abs(pts[-1][0] - x_px) > 1 or abs(pts[-1][1] - y_px) > 1):
-                pts.append((x_px, y_px))
-                st.session_state.roi_pts = pts[:2]
+    # 兩點 → ROI_0
+    if len(st.session_state.roi_pts) >= 2:
+        (x1p, y1p) = st.session_state.roi_pts[0]
+        (x2p, y2p) = st.session_state.roi_pts[1]
+        rx1, rx2 = min(x1p, x2p), max(x1p, x2p)
+        ry1, ry2 = min(y1p, y2p), max(y1p, y2p)
 
-        colA, colB = st.columns([1, 2])
-        with colA:
-            if st.button("清空點位", key="roi_clear_pts_main"):
-                st.session_state.roi_pts = []
-                st.rerun()
-        with colB:
-            st.write(f"已記錄點數：{len(st.session_state.roi_pts)}")
-            if len(st.session_state.roi_pts) > 0:
-                st.write("Points (original px):", st.session_state.roi_pts)
+        st.markdown("**ROI_0 (px)**")
+        st.code(f"({rx1:.1f}, {ry1:.1f}, {rx2:.1f}, {ry2:.1f})")
 
-        if len(st.session_state.roi_pts) >= 2:
-            (x1p, y1p) = st.session_state.roi_pts[0]
-            (x2p, y2p) = st.session_state.roi_pts[1]
-            rx1, rx2 = min(x1p, x2p), max(x1p, x2p)
-            ry1, ry2 = min(y1p, y2p), max(y1p, y2p)
+        st.markdown("**ROI_0 (mm)**")
+        st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
 
-            st.markdown("**ROI_0 (px)**")
-            st.code(f"({rx1:.1f}, {ry1:.1f}, {rx2:.1f}, {ry2:.1f})")
-
-            st.markdown("**ROI_0 (mm)**")
-            st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
-
-            figp, axp = plt.subplots(figsize=(6, 4))
-            axp.imshow(img0, origin="upper")
-            axp.add_patch(Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=2))
-            wroi = (rx2 - rx1)
-            xL = rx1 + wroi / 3.0
-            xR = rx1 + 2.0 * wroi / 3.0
-            axp.axvline(xL, lw=2)
-            axp.axvline(xR, lw=2)
-            axp.set_title("ROI_0 + split 1/3 preview (original image coords)")
-            axp.set_xlabel("X (px)")
-            axp.set_ylabel("Y (px)")
-            st.pyplot(figp)
-
-            if st.button("✅ Apply ROI_0 to Manual ROI inputs", key="apply_roi0_main"):
-                st.session_state["roi0_x1"] = float(rx1)
-                st.session_state["roi0_y1"] = float(ry1)
-                st.session_state["roi0_x2"] = float(rx2)
-                st.session_state["roi0_y2"] = float(ry2)
-                st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
-                st.session_state["show_rois"] = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
-                st.rerun()
+        if st.button("✅ Apply ROI_0 to Manual ROI inputs", key="apply_roi0_main"):
+            st.session_state["roi0_x1"] = float(rx1)
+            st.session_state["roi0_y1"] = float(ry1)
+            st.session_state["roi0_x2"] = float(rx2)
+            st.session_state["roi0_y2"] = float(ry2)
+            st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
+            st.session_state["show_rois"] = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
+            st.rerun()
 
 
 
