@@ -1,8 +1,8 @@
-streamlit
-numpy
-pandas
-h5py
-matplotlib
-xlsxwriter
-Pillow
 streamlit-drawable-canvas==0.9.3
+Pillow
+xlsxwriter
+matplotlib
+h5py
+pandas
+numpy
+streamlit
