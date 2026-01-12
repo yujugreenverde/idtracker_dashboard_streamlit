@@ -1,10 +1,10 @@
 # idtracker_dashboard_streamlit.py
-# 覆蓋版（2026-01-12 / FIX v2.1）
+# 覆蓋版（2026-01-13 / FIX v2.2）
 # 修正：
-# 1) st.image 參數相容：use_container_width / use_column_width 自動 fallback
-# 2) 點選座標：優先用 streamlit-image-coordinates（避免 canvas 與底圖錯位/不顯示）
-# 3) 若 streamlit-image-coordinates 不存在 → fallback 到 drawable-canvas（盡量穩定）
-# 4) 避免 StreamlitAPIException：不直接改 widget 綁定的 session_state（roi_mode/show_rois），改用 *_pending + rerun
+# 1) Heatmap：每個 heatmap 都用「新的 fig/ax」，避免疊圖與多重 colorbar
+# 2) Heatmap：移除重複 imshow/colorbar；加入 vmax（percentile）讓熱圖看得見
+# 3) px_to_mm：加入「短邊(mm)校正」— 量測 ROI_0 後，可輸入 ROI 短邊實際 mm，自動換算 px_to_mm(mm/px)
+# 4) StreamlitAPIException：任何 widget 綁定 key 的值（roi_mode/show_rois/px_to_mm）都用 *_pending + rerun 套用
 #
 # requirements.txt 建議：
 # streamlit
@@ -120,6 +120,13 @@ def _safe_bins(vmin, vmax, bin_size, max_bins=800):
     return b
 
 
+def _finite_xy(xy: np.ndarray) -> np.ndarray:
+    if xy.size == 0:
+        return xy
+    m = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
+    return xy[m]
+
+
 # ---------------------- App 設定 ----------------------
 st.set_page_config(layout="wide")
 st.title("🐭 idtracker.ai Dashboard")
@@ -132,19 +139,23 @@ if "roi_mode_pending" in st.session_state:
 if "show_rois_pending" in st.session_state:
     st.session_state["show_rois"] = st.session_state.pop("show_rois_pending")
 
+if "px_to_mm_pending" in st.session_state:
+    st.session_state["px_to_mm"] = st.session_state.pop("px_to_mm_pending")
+
 uploaded = st.file_uploader("請上傳軌跡檔 (.h5 / .hdf5 / .npz)", type=["h5", "hdf5", "npz"])
 
 
 # ---------------------- Sidebar 先定義（量測會用到 px_to_mm） ----------------------
 st.sidebar.header("參數設定")
-fps = st.sidebar.number_input("FPS", value=30.0, step=1.0)
+fps = st.sidebar.number_input("FPS", value=30.0, step=1.0, key="fps")
 
 px_to_mm = st.sidebar.number_input(
     "px_to_mm (mm/px)",
-    value=0.10000,
+    value=float(st.session_state.get("px_to_mm", 0.10000)),
     step=0.00001,
     min_value=0.00001,
     format="%.5f",
+    key="px_to_mm",
 )
 
 st.sidebar.subheader("ROI 模式")
@@ -155,16 +166,16 @@ roi_mode = st.sidebar.radio(
 )
 
 st.sidebar.subheader("Heatmap bin 大小")
-bin_mm = st.sidebar.number_input("bin (mm)", value=2.0, step=0.5, min_value=0.1)
-bin_px = st.sidebar.number_input("bin (px)", value=5.0, step=1.0, min_value=1.0)
+bin_mm = st.sidebar.number_input("bin (mm)", value=2.0, step=0.5, min_value=0.1, key="bin_mm")
+bin_px = st.sidebar.number_input("bin (px)", value=5.0, step=1.0, min_value=1.0, key="bin_px")
 
 st.sidebar.subheader("軌跡/Heatmap (mm) 座標軸")
-x_min_mm = st.sidebar.number_input("Xmin (mm)", value=0.0, step=1.0)
-x_max_mm = st.sidebar.number_input("Xmax (mm)", value=0.0, step=1.0)
-x_tick_mm = st.sidebar.number_input("Xtick (mm)", value=0.0, step=0.5)
-y_min_mm = st.sidebar.number_input("Ymin (mm)", value=0.0, step=1.0)
-y_max_mm = st.sidebar.number_input("Ymax (mm)", value=0.0, step=1.0)
-y_tick_mm = st.sidebar.number_input("Ytick (mm)", value=0.0, step=0.5)
+x_min_mm = st.sidebar.number_input("Xmin (mm)", value=0.0, step=1.0, key="x_min_mm")
+x_max_mm = st.sidebar.number_input("Xmax (mm)", value=0.0, step=1.0, key="x_max_mm")
+x_tick_mm = st.sidebar.number_input("Xtick (mm)", value=0.0, step=0.5, key="x_tick_mm")
+y_min_mm = st.sidebar.number_input("Ymin (mm)", value=0.0, step=1.0, key="y_min_mm")
+y_max_mm = st.sidebar.number_input("Ymax (mm)", value=0.0, step=1.0, key="y_max_mm")
+y_tick_mm = st.sidebar.number_input("Ytick (mm)", value=0.0, step=0.5, key="y_tick_mm")
 
 
 # ---------------------- PNG 量測工具（主頁） ----------------------
@@ -204,7 +215,6 @@ if img_file_main is not None:
         else:
             # drawable-canvas fallback with data-url background
             bg_url = pil_to_data_url(img_disp, fmt="PNG")
-            # 盡量用最保守參數，避免版本 TypeError
             try:
                 canvas = st_canvas(
                     background_color="white",
@@ -226,7 +236,6 @@ if img_file_main is not None:
                     key="roi_canvas_fallback",
                 )
 
-            # 把 canvas 點位轉成 click 格式
             if canvas is not None and canvas.json_data is not None:
                 objs = canvas.json_data.get("objects", [])
                 if objs:
@@ -244,7 +253,7 @@ if img_file_main is not None:
         x_px = x_disp / scale
         y_px = y_disp / scale
 
-        # mm
+        # mm（使用目前 px_to_mm）
         x_mm = x_px * px_to_mm
         y_mm = y_px * px_to_mm
 
@@ -276,8 +285,37 @@ if img_file_main is not None:
         st.markdown("**ROI_0 (px)**")
         st.code(f"({rx1:.1f}, {ry1:.1f}, {rx2:.1f}, {ry2:.1f})")
 
-        st.markdown("**ROI_0 (mm)**")
+        st.markdown("**ROI_0 (mm)**（使用目前 px_to_mm）")
         st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
+
+        # --- NEW: 用 ROI 短邊實際長度(mm) 反推 px_to_mm ---
+        roi_w_px = float(rx2 - rx1)
+        roi_h_px = float(ry2 - ry1)
+        roi_short_px = float(min(roi_w_px, roi_h_px))
+        st.markdown("### 📏 用 ROI 短邊校正 px_to_mm")
+        st.caption("做法：你用兩點定義 ROI_0 後，輸入『ROI 短邊』的真實長度 (mm)，系統用 mm/px 反推 px_to_mm。")
+
+        colC, colD, colE = st.columns([1.3, 1, 1])
+        with colC:
+            short_mm = st.number_input(
+                "ROI 短邊真實長度 (mm)",
+                value=float(st.session_state.get("roi_short_mm", 0.0)),
+                step=0.1,
+                min_value=0.0,
+                key="roi_short_mm",
+            )
+        with colD:
+            st.write("短邊(px)")
+            st.code(f"{roi_short_px:.2f}")
+        with colE:
+            if st.button("用短邊換算 px_to_mm", key="btn_calib_px_to_mm"):
+                if short_mm <= 0 or roi_short_px <= 0:
+                    st.warning("短邊 mm 與短邊 px 都必須 > 0 才能校正。")
+                else:
+                    new_px_to_mm = float(short_mm) / float(roi_short_px)
+                    st.session_state["px_to_mm_pending"] = new_px_to_mm
+                    st.success(f"已計算 px_to_mm = {new_px_to_mm:.6f} mm/px（將 rerun 套用到 sidebar）")
+                    st.rerun()
 
         # ✅ 重要：不要直接改 roi_mode（它被 radio 綁 key="roi_mode"）
         if st.button("✅ Apply ROI_0 to Manual ROI inputs", key="apply_roi0_main"):
@@ -286,7 +324,6 @@ if img_file_main is not None:
             st.session_state["roi0_x2"] = float(rx2)
             st.session_state["roi0_y2"] = float(ry2)
 
-            # pending -> rerun -> 在 widget 建立前套用
             st.session_state["roi_mode_pending"] = "Manual ROI_0 + Split Left/Right 1/3"
             st.session_state["show_rois_pending"] = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
             st.rerun()
@@ -398,8 +435,8 @@ ids = meta["ids"]
 total_frames = meta["frame_count"]
 
 max_frame = max(0, total_frames - 1)
-frame_start = st.sidebar.number_input("Start frame", 0, max_frame, 0)
-frame_end = st.sidebar.number_input("End frame", 0, max_frame, max_frame)
+frame_start = st.sidebar.number_input("Start frame", 0, max_frame, 0, key="frame_start")
+frame_end = st.sidebar.number_input("End frame", 0, max_frame, max_frame, key="frame_end")
 
 ROI_RANGES = []
 if roi_mode.startswith("Auto"):
@@ -517,7 +554,6 @@ st.dataframe(df_dwell, use_container_width=True)
 
 
 # ---------------------- ROI 顯示選項 ----------------------
-# (show_rois 也是 widget key，若你要程式控制，請用 show_rois_pending)
 roi_names = [r["name"] for r in ROI_RANGES]
 default_show = roi_names if len(roi_names) > 0 else []
 show_rois = st.sidebar.multiselect(
@@ -568,7 +604,7 @@ st.subheader("軌跡圖 (mm)")
 fig, ax = plt.subplots(figsize=(6, 6))
 for i, data in per_id.items():
     xy = data["xy_mm"]
-    ax.plot(xy[:, 0], xy[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
+    ax.plot(xy[:, 0], xy[:, 1], lw=0.7, alpha=0.6)
 
 for roi in ROI_RANGES:
     if roi["name"] in show_rois:
@@ -586,14 +622,14 @@ apply_axis(
 )
 ax.set_xlabel("X (mm)")
 ax.set_ylabel("Y (mm)")
-ax.legend(fontsize=6, loc="best")
 st.pyplot(fig)
+plt.close(fig)
 
 st.subheader("軌跡圖 (px)")
 fig, ax = plt.subplots(figsize=(6, 6))
 for i in ids:
     xy_px = positions_px[i][frame_start: frame_end + 1, :]
-    ax.plot(xy_px[:, 0], xy_px[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
+    ax.plot(xy_px[:, 0], xy_px[:, 1], lw=0.7, alpha=0.6)
 
 for roi in ROI_RANGES:
     if roi["name"] in show_rois:
@@ -603,51 +639,34 @@ for roi in ROI_RANGES:
 
 ax.set_xlabel("X (px)")
 ax.set_ylabel("Y (px)")
-ax.legend(fontsize=6, loc="best")
 st.pyplot(fig)
+plt.close(fig)
 
+# -------- Heatmap (mm) --------
 st.subheader("Heatmap (mm)")
-all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()])
-
-# ✅ 只保留 finite 點
-finite_mask = np.isfinite(all_xy_mm_plot[:, 0]) & np.isfinite(all_xy_mm_plot[:, 1])
-xy_finite = all_xy_mm_plot[finite_mask]
+all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()]) if len(per_id) else np.zeros((0, 2))
+xy_finite = _finite_xy(all_xy_mm_plot)
 
 if xy_finite.shape[0] < 2:
-    st.warning("Heatmap(mm) 無有效資料點（可能 ROI / frame 設定後全為 NaN），略過。")
+    st.warning("Heatmap(mm) 無有效資料點（可能資料全為 NaN/inf），略過。")
 else:
-    bx = _safe_bins(
-        np.min(xy_finite[:, 0]),
-        np.max(xy_finite[:, 0]),
-        bin_mm,
-    )
-    by = _safe_bins(
-        np.min(xy_finite[:, 1]),
-        np.max(xy_finite[:, 1]),
-        bin_mm,
-    )
+    bx = _safe_bins(np.min(xy_finite[:, 0]), np.max(xy_finite[:, 0]), bin_mm)
+    by = _safe_bins(np.min(xy_finite[:, 1]), np.max(xy_finite[:, 1]), bin_mm)
 
-    H, xedges, yedges = np.histogram2d(
-        xy_finite[:, 0],
-        xy_finite[:, 1],
-        bins=[bx, by],
-    )
+    H, xedges, yedges = np.histogram2d(xy_finite[:, 0], xy_finite[:, 1], bins=[bx, by])
 
+    fig, ax = plt.subplots(figsize=(6, 6))  # ✅ 新 figure，避免疊圖/多重 colorbar
+
+    vmax = np.percentile(H, 99) if np.any(H > 0) else 1.0
     im = ax.imshow(
         H.T,
         origin="lower",
         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
         aspect="auto",
         cmap="hot",
-    )
-    fig.colorbar(im, ax=ax)
-
-    im = ax.imshow(
-        H.T,
-        origin="lower",
-        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-        aspect="auto",
-        cmap="hot",
+        vmin=0,
+        vmax=vmax,
+        interpolation="nearest",
     )
     fig.colorbar(im, ax=ax)
 
@@ -655,72 +674,52 @@ else:
         if roi["name"] in show_rois:
             x1p, y1p, x2p, y2p = roi["rect"]
             x1m, y1m, x2m, y2m = x1p * px_to_mm, y1p * px_to_mm, x2p * px_to_mm, y2p * px_to_mm
-            rect = Rectangle((x1m, y1m), x2m - x1m, y2m - y1m, fill=False, lw=1.2, alpha=0.9, color="cyan")
+            rect = Rectangle((x1m, y1m), x2m - x1m, y2m - y1m, fill=False, lw=1.2, alpha=0.9)
             ax.add_patch(rect)
 
     ax.set_xlabel("X (mm)")
     ax.set_ylabel("Y (mm)")
     st.pyplot(fig)
+    plt.close(fig)
 
+# -------- Heatmap (px) --------
 st.subheader("Heatmap (px)")
-all_xy_px_plot = np.vstack(
-    [positions_px[i][frame_start : frame_end + 1, :] for i in ids]
-)
-
-# ✅ 只保留 finite 點
-finite_mask = (
-    np.isfinite(all_xy_px_plot[:, 0]) &
-    np.isfinite(all_xy_px_plot[:, 1])
-)
-xy_finite = all_xy_px_plot[finite_mask]
+all_xy_px_plot = np.vstack([positions_px[i][frame_start: frame_end + 1, :] for i in ids]) if len(ids) else np.zeros((0, 2))
+xy_finite = _finite_xy(all_xy_px_plot)
 
 if xy_finite.shape[0] < 2:
-    st.warning("Heatmap(px) 無有效資料點（可能 ROI / frame 設定後全為 NaN），略過。")
+    st.warning("Heatmap(px) 無有效資料點（可能資料全為 NaN/inf），略過。")
 else:
-    bx = _safe_bins(
-        np.min(xy_finite[:, 0]),
-        np.max(xy_finite[:, 0]),
-        bin_px,
-    )
-    by = _safe_bins(
-        np.min(xy_finite[:, 1]),
-        np.max(xy_finite[:, 1]),
-        bin_px,
-    )
+    bx = _safe_bins(np.min(xy_finite[:, 0]), np.max(xy_finite[:, 0]), bin_px)
+    by = _safe_bins(np.min(xy_finite[:, 1]), np.max(xy_finite[:, 1]), bin_px)
 
-    H, xedges, yedges = np.histogram2d(
-        xy_finite[:, 0],
-        xy_finite[:, 1],
-        bins=[bx, by],
-    )
+    H, xedges, yedges = np.histogram2d(xy_finite[:, 0], xy_finite[:, 1], bins=[bx, by])
 
+    fig, ax = plt.subplots(figsize=(6, 6))  # ✅ 新 figure，避免疊圖/多重 colorbar
+
+    vmax = np.percentile(H, 99) if np.any(H > 0) else 1.0
     im = ax.imshow(
         H.T,
         origin="lower",
         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
         aspect="auto",
         cmap="hot",
-    )
-    fig.colorbar(im, ax=ax)
-
-    im = ax.imshow(
-        H.T,
-        origin="lower",
-        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-        aspect="auto",
-        cmap="hot",
+        vmin=0,
+        vmax=vmax,
+        interpolation="nearest",
     )
     fig.colorbar(im, ax=ax)
 
     for roi in ROI_RANGES:
         if roi["name"] in show_rois:
             x1p, y1p, x2p, y2p = roi["rect"]
-            rect = Rectangle((x1p, y1p), x2p - x1p, y2p - y1p, fill=False, lw=1.2, alpha=0.9, color="cyan")
+            rect = Rectangle((x1p, y1p), x2p - x1p, y2p - y1p, fill=False, lw=1.2, alpha=0.9)
             ax.add_patch(rect)
 
     ax.set_xlabel("X (px)")
     ax.set_ylabel("Y (px)")
     st.pyplot(fig)
+    plt.close(fig)
 
 # 速度與角速度
 st.subheader("速度與角速度曲線")
@@ -733,6 +732,7 @@ for i, data in per_id.items():
     ax[1].set_xlabel("Frame")
     fig.suptitle(f"ID {i}")
     st.pyplot(fig)
+    plt.close(fig)
 
 # ---------------------- 匯出 Excel/PDF/ZIP ----------------------
 st.subheader("匯出結果")
