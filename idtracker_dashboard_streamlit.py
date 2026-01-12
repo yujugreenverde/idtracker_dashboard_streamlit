@@ -4,10 +4,14 @@
 # 1) Heatmap bins 防呆：避免 int(dx/bin)=0 造成 np.histogram2d ValueError
 # 2) Heatmap / bbox 計算忽略 NaN/inf：避免 max/min 爆掉
 # 3) Heatmap 資料點不足時改為提示，不直接 crash
+# 4) 新增 Two-ROI 模式：可針對「左右兩個 ROI（polygon）」做分析與呈現
+#    - Sidebar 可貼 ROI polygon 座標（px）
+#    - 輸出 Left/Right dwell、Preference Index
+#    - 圖上可顯示 ROI polygon 框線
 
 import os
 import io
-import math
+import json
 import tempfile
 import zipfile
 import numpy as np
@@ -19,7 +23,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Polygon
+from matplotlib.path import Path
 
 # ---------------------- 小工具 ----------------------
 def fig_to_png_bytes(fig, dpi=200):
@@ -75,14 +80,49 @@ def _safe_hist2d(x: np.ndarray, y: np.ndarray, bin_size: float):
     dx = float(np.max(x) - np.min(x))
     dy = float(np.max(y) - np.min(y))
 
-    # 防呆：若 dx/dy 太小，仍至少 1 bin
-    # 也避免 bin_size 造成除以 0（UI 已限制 min_value，但保險）
     bin_size = float(bin_size) if float(bin_size) > 0 else 1.0
     nx = max(1, int(dx / bin_size))
     ny = max(1, int(dy / bin_size))
 
     H, xedges, yedges = np.histogram2d(x, y, bins=[nx, ny])
     return H, xedges, yedges, nx, ny, n_points
+
+def _parse_polygon_text(txt: str):
+    """
+    Accept formats:
+    - JSON list: [[x,y],[x,y],...]
+    - or python-like list
+    Returns np.ndarray shape (K,2)
+    """
+    if txt is None:
+        return None
+    s = txt.strip()
+    if not s:
+        return None
+    try:
+        poly = json.loads(s)
+    except Exception:
+        # fallback: try python literal style safely-ish
+        try:
+            import ast
+            poly = ast.literal_eval(s)
+        except Exception as e:
+            raise ValueError(f"ROI polygon 解析失敗：請用 [[x,y],[x,y],...] 格式。錯誤：{e}")
+
+    arr = np.array(poly, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 3:
+        raise ValueError("ROI polygon 需要至少 3 個點，格式為 [[x,y],[x,y],...]")
+    if not np.isfinite(arr).all():
+        raise ValueError("ROI polygon 內含 NaN/inf，請檢查座標。")
+    return arr
+
+def in_polygon(xy, poly_xy):
+    """Boolean mask for points in polygon (including boundary approximately)."""
+    if poly_xy is None or len(poly_xy) < 3:
+        return np.zeros((xy.shape[0],), dtype=bool)
+    p = Path(poly_xy, closed=True)
+    # contains_points 不含邊界；加一點點 radius 容忍
+    return p.contains_points(xy, radius=1e-9)
 
 # ---------------------- Streamlit App 設定 ----------------------
 st.set_page_config(layout="wide")
@@ -96,6 +136,13 @@ fps = st.sidebar.number_input("FPS", value=30.0, step=1.0)
 px_to_mm = st.sidebar.number_input(
     "px_to_mm (mm/px)", value=0.10000, step=0.00001, min_value=0.00001, format="%.5f"
 )
+
+roi_mode = st.sidebar.radio(
+    "ROI 模式",
+    ["Auto (ROI_0~F 自動切)", "Two-ROI (左右兩個 ROI)"],
+    index=1,
+)
+
 target_side = st.sidebar.radio("實驗 Target 在哪一側？", ["左", "右"], horizontal=True)
 
 st.sidebar.subheader("Heatmap bin 大小")
@@ -109,6 +156,28 @@ x_tick_mm = st.sidebar.number_input("Xtick (mm)", value=0.0, step=0.5)
 y_min_mm = st.sidebar.number_input("Ymin (mm)", value=0.0, step=1.0)
 y_max_mm = st.sidebar.number_input("Ymax (mm)", value=0.0, step=1.0)
 y_tick_mm = st.sidebar.number_input("Ytick (mm)", value=0.0, step=0.5)
+
+# Two-ROI polygon inputs (px)
+poly_left_px = None
+poly_right_px = None
+if roi_mode.startswith("Two-ROI"):
+    st.sidebar.subheader("Two-ROI：貼上 ROI polygon 座標 (px)")
+    st.sidebar.caption("格式：[[x,y],[x,y],[x,y],[x,y]]（至少 3 點）。你可以直接貼 TRex 裡 ROI 列表的座標。")
+
+    # 依你截圖裡的例子，先放一組預設值（左 ROI x 較小、右 ROI x 較大）
+    default_left = "[[274.1,236.2],[504.0,231.8],[508.5,479.3],[267.5,474.9]]"
+    default_right = "[[769.3,242.8],[767.1,474.9],[988.2,477.1],[999.2,245.0]]"
+
+    txt_left = st.sidebar.text_area("Left ROI polygon (px)", value=default_left, height=80)
+    txt_right = st.sidebar.text_area("Right ROI polygon (px)", value=default_right, height=80)
+
+    try:
+        poly_left_px = _parse_polygon_text(txt_left)
+        poly_right_px = _parse_polygon_text(txt_right)
+    except Exception as e:
+        st.sidebar.error(str(e))
+        poly_left_px = None
+        poly_right_px = None
 
 # ---------------------- 載入軌跡 ----------------------
 def load_trajectories(path):
@@ -159,23 +228,23 @@ def _detect_outer_bbox_from_file(path):
 def generate_auto_rois(x1, y1, x2, y2, target_side="左"):
     x3 = (x1 + x2) / 2
     y3 = (y1 + y2) / 2
-    rois = [{"name": "ROI_0", "rect": (x1, y1, x2, y2)}]
+    rois = [{"name": "ROI_0", "rect": (x1, y1, x2, y2), "type": "rect"}]
     if target_side == "左":
         rois += [
-            {"name": "ROI_A", "rect": (x1, y1, x3, y2)},
-            {"name": "ROI_B", "rect": (x3, y1, x2, y2)},
-            {"name": "ROI_E", "rect": (x1, y1, x3, y3)},
-            {"name": "ROI_F", "rect": (x3, y1, x2, y3)},
+            {"name": "ROI_A", "rect": (x1, y1, x3, y2), "type": "rect"},
+            {"name": "ROI_B", "rect": (x3, y1, x2, y2), "type": "rect"},
+            {"name": "ROI_E", "rect": (x1, y1, x3, y3), "type": "rect"},
+            {"name": "ROI_F", "rect": (x3, y1, x2, y3), "type": "rect"},
         ]
     else:
         rois += [
-            {"name": "ROI_A", "rect": (x3, y1, x2, y2)},
-            {"name": "ROI_B", "rect": (x1, y1, x3, y2)},
-            {"name": "ROI_E", "rect": (x3, y1, x2, y3)},
-            {"name": "ROI_F", "rect": (x1, y1, x3, y3)},
+            {"name": "ROI_A", "rect": (x3, y1, x2, y2), "type": "rect"},
+            {"name": "ROI_B", "rect": (x1, y1, x3, y2), "type": "rect"},
+            {"name": "ROI_E", "rect": (x3, y1, x2, y3), "type": "rect"},
+            {"name": "ROI_F", "rect": (x1, y1, x3, y3), "type": "rect"},
         ]
-    rois.append({"name": "ROI_C", "rect": (x1, y1, x2, y3)})
-    rois.append({"name": "ROI_D", "rect": (x1, y3, x2, y2)})
+    rois.append({"name": "ROI_C", "rect": (x1, y1, x2, y3), "type": "rect"})
+    rois.append({"name": "ROI_D", "rect": (x1, y3, x2, y2), "type": "rect"})
     return rois
 
 if uploaded is None:
@@ -193,7 +262,6 @@ total_frames = meta["frame_count"]
 
 detected_bbox = _detect_outer_bbox_from_file(tmp_path)
 if detected_bbox is None:
-    # bbox fallback：用所有點的 min/max，但要先濾掉 NaN/inf
     all_xy_tmp = np.vstack([positions_px[i] for i in ids])
     all_xy_tmp = _finite_xy(all_xy_tmp)
     if all_xy_tmp is None or all_xy_tmp.size == 0:
@@ -203,7 +271,18 @@ if detected_bbox is None:
     detected_bbox = (x1, y1, x2, y2)
 
 x1, y1, x2, y2 = detected_bbox
-ROI_RANGES = generate_auto_rois(x1, y1, x2, y2, target_side)
+
+# ROI definitions
+ROI_RANGES = []
+if roi_mode.startswith("Auto"):
+    ROI_RANGES = generate_auto_rois(x1, y1, x2, y2, target_side)
+else:
+    # Two ROI (polygon) defined in px; also define an overall bbox ROI_0 (rect) for reference
+    ROI_RANGES.append({"name": "ROI_0", "rect": (x1, y1, x2, y2), "type": "rect"})
+    if poly_left_px is not None:
+        ROI_RANGES.append({"name": "ROI_LEFT", "poly_px": poly_left_px, "type": "poly"})
+    if poly_right_px is not None:
+        ROI_RANGES.append({"name": "ROI_RIGHT", "poly_px": poly_right_px, "type": "poly"})
 
 # ---------------------- Frame 範圍 ----------------------
 max_frame = max(0, total_frames - 1)
@@ -236,7 +315,7 @@ for i in ids:
     xy_mm = xy_px * px_to_mm
     spd = compute_speed_mm_per_s(xy_mm, fps)
     ang = compute_ang_vel_deg_per_s(xy_mm, fps)
-    per_id[i] = {"xy_mm": xy_mm, "speed": spd, "angvel": ang}
+    per_id[i] = {"xy_px": xy_px, "xy_mm": xy_mm, "speed": spd, "angvel": ang}
 
 # ---------------------- Global Summary ----------------------
 all_dist = []
@@ -263,19 +342,32 @@ st.subheader("整體統計")
 st.dataframe(df_global, use_container_width=True)
 
 # ---------------------- ROI 統計 ----------------------
-def in_rect(xy_mm, rect):
+def in_rect(xy, rect):
     x1, y1, x2, y2 = rect
-    return (xy_mm[:, 0] >= x1) & (xy_mm[:, 0] <= x2) & (xy_mm[:, 1] >= y1) & (xy_mm[:, 1] <= y2)
+    return (xy[:, 0] >= x1) & (xy[:, 0] <= x2) & (xy[:, 1] >= y1) & (xy[:, 1] <= y2)
 
 df_dwell = []
 for i, data in per_id.items():
-    xy = data["xy_mm"]
+    xy_mm = data["xy_mm"]
+    xy_px = data["xy_px"]
+
     for roi in ROI_RANGES:
         name = roi["name"]
-        mask = in_rect(xy, roi["rect"])
+
+        if roi.get("type") == "rect":
+            mask = in_rect(xy_mm, roi["rect"])  # rect ROI is stored in bbox px-space but we apply on mm? -> bbox derived from px; keep consistent by converting bbox to mm
+            # NOTE: bbox came from px; but xy_mm is mm. Convert rect px->mm:
+            rx1, ry1, rx2, ry2 = roi["rect"]
+            rect_mm = (rx1 * px_to_mm, ry1 * px_to_mm, rx2 * px_to_mm, ry2 * px_to_mm)
+            mask = in_rect(xy_mm, rect_mm)
+        else:
+            poly_px = roi["poly_px"]
+            mask = in_polygon(xy_px, poly_px)
+
         frames_in = int(np.count_nonzero(mask))
         mean_spd = float(np.nanmean(np.where(mask, data["speed"], np.nan)))
         mean_ang = float(np.nanmean(np.where(mask, data["angvel"], np.nan)))
+
         df_dwell.append(
             {
                 "ID": i,
@@ -291,6 +383,33 @@ df_dwell = pd.DataFrame(df_dwell)
 st.subheader("ROI 統計")
 st.dataframe(df_dwell, use_container_width=True)
 
+# ---------------------- Two-ROI Preference Summary ----------------------
+df_pref = None
+if roi_mode.startswith("Two-ROI") and {"ROI_LEFT", "ROI_RIGHT"}.issubset(set(df_dwell["ROI"].unique())):
+    pivot = df_dwell.pivot_table(index="ID", columns="ROI", values="Time_in_ROI_s", aggfunc="sum").fillna(0.0)
+    tL = pivot.get("ROI_LEFT", pd.Series(0.0, index=pivot.index))
+    tR = pivot.get("ROI_RIGHT", pd.Series(0.0, index=pivot.index))
+    denom = (tL + tR).replace(0, np.nan)
+    pi = (tL - tR) / denom
+
+    df_pref = pd.DataFrame(
+        {
+            "ID": pivot.index,
+            "Time_Left_s": np.round(tL.values, 3),
+            "Time_Right_s": np.round(tR.values, 3),
+            "PreferenceIndex_(L-R)/(L+R)": np.round(pi.values, 3),
+        }
+    )
+
+    st.subheader("Two-ROI 偏好指標 (Preference Index)")
+    st.dataframe(df_pref, use_container_width=True)
+
+    # aggregate
+    TL = float(np.nansum(tL.values))
+    TR = float(np.nansum(tR.values))
+    PI_all = (TL - TR) / (TL + TR) if (TL + TR) > 0 else np.nan
+    st.caption(f"All IDs total: Left={TL:.3f}s, Right={TR:.3f}s, PI={PI_all:.3f}")
+
 # ---------------------- Sidebar: ROI 顯示選項 ----------------------
 roi_names = [r["name"] for r in ROI_RANGES]
 show_rois = st.sidebar.multiselect("要在圖上顯示哪些 ROI 框線？", options=roi_names, default=roi_names)
@@ -301,11 +420,21 @@ fig, ax = plt.subplots(figsize=(6, 6))
 for i, data in per_id.items():
     xy = data["xy_mm"]
     ax.plot(xy[:, 0], xy[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
+
+# draw ROIs
 for roi in ROI_RANGES:
-    if roi["name"] in show_rois:
+    if roi["name"] not in show_rois:
+        continue
+    if roi.get("type") == "rect":
         rx1, ry1, rx2, ry2 = roi["rect"]
-        rect = Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=1.0, alpha=0.8)
-        ax.add_patch(rect)
+        rect_mm = (rx1 * px_to_mm, ry1 * px_to_mm, rx2 * px_to_mm, ry2 * px_to_mm)
+        x1m, y1m, x2m, y2m = rect_mm
+        ax.add_patch(Rectangle((x1m, y1m), x2m - x1m, y2m - y1m, fill=False, lw=1.0, alpha=0.8))
+    else:
+        poly_px = roi["poly_px"]
+        poly_mm = poly_px * px_to_mm
+        ax.add_patch(Polygon(poly_mm, closed=True, fill=False, lw=1.2, alpha=0.9))
+
 apply_axis(
     ax,
     xlim=_lim_tuple(x_min_mm, x_max_mm),
@@ -323,11 +452,17 @@ fig, ax = plt.subplots(figsize=(6, 6))
 for i in ids:
     xy_px = positions_px[i][frame_start : frame_end + 1, :]
     ax.plot(xy_px[:, 0], xy_px[:, 1], lw=0.7, alpha=0.6, label=f"ID {i}")
+
 for roi in ROI_RANGES:
-    if roi["name"] in show_rois:
+    if roi["name"] not in show_rois:
+        continue
+    if roi.get("type") == "rect":
         rx1, ry1, rx2, ry2 = roi["rect"]
-        rect = Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=1.0, alpha=0.8)
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=1.0, alpha=0.8))
+    else:
+        poly_px = roi["poly_px"]
+        ax.add_patch(Polygon(poly_px, closed=True, fill=False, lw=1.2, alpha=0.9))
+
 ax.set_xlabel("X (px)")
 ax.set_ylabel("Y (px)")
 ax.legend(fontsize=6, loc="best")
@@ -350,19 +485,19 @@ else:
         cmap="hot",
     )
     fig.colorbar(im, ax=ax)
+
     for roi in ROI_RANGES:
-        if roi["name"] in show_rois:
+        if roi["name"] not in show_rois:
+            continue
+        if roi.get("type") == "rect":
             rx1, ry1, rx2, ry2 = roi["rect"]
-            rect = Rectangle(
-                (rx1, ry1),
-                rx2 - rx1,
-                ry2 - ry1,
-                fill=False,
-                lw=1.0,
-                alpha=0.8,
-                color="cyan",
-            )
-            ax.add_patch(rect)
+            rect_mm = (rx1 * px_to_mm, ry1 * px_to_mm, rx2 * px_to_mm, ry2 * px_to_mm)
+            x1m, y1m, x2m, y2m = rect_mm
+            ax.add_patch(Rectangle((x1m, y1m), x2m - x1m, y2m - y1m, fill=False, lw=1.0, alpha=0.8, color="cyan"))
+        else:
+            poly_mm = roi["poly_px"] * px_to_mm
+            ax.add_patch(Polygon(poly_mm, closed=True, fill=False, lw=1.2, alpha=0.9, color="cyan"))
+
     ax.set_xlabel("X (mm)")
     ax.set_ylabel("Y (mm)")
     st.caption(f"bins = ({nx}, {ny}), points = {npts}")
@@ -385,25 +520,22 @@ else:
         cmap="hot",
     )
     fig.colorbar(im, ax=ax)
+
     for roi in ROI_RANGES:
-        if roi["name"] in show_rois:
+        if roi["name"] not in show_rois:
+            continue
+        if roi.get("type") == "rect":
             rx1, ry1, rx2, ry2 = roi["rect"]
-            rect = Rectangle(
-                (rx1, ry1),
-                rx2 - rx1,
-                ry2 - ry1,
-                fill=False,
-                lw=1.0,
-                alpha=0.8,
-                color="cyan",
-            )
-            ax.add_patch(rect)
+            ax.add_patch(Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=1.0, alpha=0.8, color="cyan"))
+        else:
+            ax.add_patch(Polygon(roi["poly_px"], closed=True, fill=False, lw=1.2, alpha=0.9, color="cyan"))
+
     ax.set_xlabel("X (px)")
     ax.set_ylabel("Y (px)")
     st.caption(f"bins = ({nx}, {ny}), points = {npts}")
     st.pyplot(fig)
 
-# 速度與角速度
+# ---------------------- 速度與角速度 ----------------------
 st.subheader("速度與角速度曲線")
 for i, data in per_id.items():
     fig, ax = plt.subplots(2, 1, figsize=(8, 4), sharex=True)
@@ -418,19 +550,28 @@ for i, data in per_id.items():
 # ---------------------- 匯出 Excel/PDF/ZIP ----------------------
 st.subheader("匯出結果")
 
-df_roi_ranges = pd.DataFrame(
-    [
-        {"ROI": r["name"], "x1": r["rect"][0], "y1": r["rect"][1], "x2": r["rect"][2], "y2": r["rect"][3]}
-        for r in ROI_RANGES
-    ]
-)
+# ROI ranges export：同時支援 rect(mm) 與 poly(px)
+rows_roi = []
+for r in ROI_RANGES:
+    if r.get("type") == "rect":
+        rx1, ry1, rx2, ry2 = r["rect"]
+        rows_roi.append({"ROI": r["name"], "type": "rect_px", "x1": rx1, "y1": ry1, "x2": rx2, "y2": ry2, "poly_px": ""})
+    else:
+        poly = r["poly_px"]
+        rows_roi.append({"ROI": r["name"], "type": "poly_px", "x1": np.nan, "y1": np.nan, "x2": np.nan, "y2": np.nan, "poly_px": json.dumps(poly.tolist())})
+
+df_roi_ranges = pd.DataFrame(rows_roi)
+
 df_meta = pd.DataFrame(
     [
         {
             "px_to_mm": px_to_mm,
+            "fps": fps,
             "frame_start": frame_start,
             "frame_end": frame_end,
             "frame_count": frame_end - frame_start + 1,
+            "roi_mode": roi_mode,
+            "target_side": target_side,
         }
     ]
 )
@@ -440,8 +581,10 @@ if st.button("⬇️ 匯出 Excel"):
     with pd.ExcelWriter(excel_buf, engine="xlsxwriter") as writer:
         df_global.to_excel(writer, sheet_name="Global", index=False)
         df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
-        df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
+        df_roi_ranges.to_excel(writer, sheet_name="ROI_Definitions", index=False)
         df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
+        if df_pref is not None:
+            df_pref.to_excel(writer, sheet_name="TwoROI_Preference", index=False)
     excel_buf.seek(0)
     st.download_button(
         "下載 Excel",
@@ -461,6 +604,7 @@ if st.button("⬇️ 匯出 PDF"):
         tbl.set_fontsize(8)
         pdf.savefig(fig)
         plt.close(fig)
+
         # ROI Summary
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.axis("off")
@@ -469,14 +613,26 @@ if st.button("⬇️ 匯出 PDF"):
         tbl.set_fontsize(6)
         pdf.savefig(fig)
         plt.close(fig)
-        # ROI Ranges
+
+        # TwoROI preference
+        if df_pref is not None:
+            fig, ax = plt.subplots(figsize=(8, 3))
+            ax.axis("off")
+            tbl = ax.table(cellText=df_pref.values, colLabels=df_pref.columns, loc="center")
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(7)
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # ROI definitions
         fig, ax = plt.subplots(figsize=(8, 3))
         ax.axis("off")
         tbl = ax.table(cellText=df_roi_ranges.values, colLabels=df_roi_ranges.columns, loc="center")
         tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8)
+        tbl.set_fontsize(6)
         pdf.savefig(fig)
         plt.close(fig)
+
         # Meta Info
         fig, ax = plt.subplots(figsize=(6, 2))
         ax.axis("off")
@@ -497,15 +653,20 @@ if st.button("⬇️ 匯出 ZIP"):
         with pd.ExcelWriter(excel_bytes, engine="xlsxwriter") as writer:
             df_global.to_excel(writer, sheet_name="Global", index=False)
             df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
-            df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
+            df_roi_ranges.to_excel(writer, sheet_name="ROI_Definitions", index=False)
             df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
+            if df_pref is not None:
+                df_pref.to_excel(writer, sheet_name="TwoROI_Preference", index=False)
         excel_bytes.seek(0)
         zf.writestr("all_results.xlsx", excel_bytes.read())
+
         # CSV
         zf.writestr("global_summary.csv", df_global.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("roi_summary.csv", df_dwell.to_csv(index=False).encode("utf-8-sig"))
-        zf.writestr("roi_ranges.csv", df_roi_ranges.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("roi_definitions.csv", df_roi_ranges.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("meta_info.csv", df_meta.to_csv(index=False).encode("utf-8-sig"))
+        if df_pref is not None:
+            zf.writestr("two_roi_preference.csv", df_pref.to_csv(index=False).encode("utf-8-sig"))
 
     zip_buf.seek(0)
     st.download_button("下載 ZIP", data=zip_buf, file_name="all_results_bundle.zip", mime="application/zip")
