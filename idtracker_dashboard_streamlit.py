@@ -1,13 +1,14 @@
 # idtracker_dashboard_streamlit.py
-# 覆蓋版（2026-01-12）
-# 新增：
-# 1) PNG frame 點選量測：顯示 px 與 mm
-# 2) ROI_0 兩點定義：自動算 (x1,y1,x2,y2) + mm
-# 3) 一鍵自動填入 Manual ROI_0 欄位（不用手抄）
-# 4) ROI_0 + 左/中/右 1/3 分割線預覽（避免左右弄反）
-# 5) Heatmap bins 防呆（避免 ValueError）
+# 覆蓋版（2026-01-12 / FIX）
+# 修正：
+# A) streamlit-drawable-canvas 在 Cloud 可能因 background_image 轉 URL 掛掉
+#    → 改用 data URL（background_image_url）避免 image_to_url 崩潰
+# B) Apply ROI to plots 之前放在 expander 外、且用到 rx1/rx2 造成 NameError
+#    → 改成「按鈕只用 session_state.roi_pts 重新算 ROI_0」，並放在 expander 內（img_file 有效才顯示）
+# C) include_mid / roi_mode / show_rois 一鍵同步 OK
+# D) Heatmap bins 防呆（保留）
 #
-# 依賴（Streamlit Cloud 請放 requirements.txt）：
+# 依賴（Streamlit Cloud requirements.txt）：
 # streamlit
 # numpy
 # pandas
@@ -22,6 +23,8 @@ import io
 import math
 import tempfile
 import zipfile
+import base64
+
 import numpy as np
 import pandas as pd
 import h5py
@@ -32,7 +35,6 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
-
 from PIL import Image
 
 try:
@@ -84,6 +86,26 @@ def _safe_bins(vmin, vmax, bin_size, max_bins=800):
     return b
 
 
+def pil_to_data_url(img: Image.Image, fmt="PNG") -> str:
+    """把 PIL Image 轉成 data URL（避免 drawable-canvas 在 Cloud 的 image_to_url 崩潰）"""
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/{fmt.lower()};base64,{b64}"
+
+
+def resize_if_too_large(img: Image.Image, max_side=1600) -> Image.Image:
+    """避免 data URL 太大：長邊>max_side 就縮圖"""
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    scale = max_side / float(m)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return img.resize((new_w, new_h))
+
+
 # ---------------------- Streamlit App 設定 ----------------------
 st.set_page_config(layout="wide")
 st.title("🐭 idtracker.ai Dashboard")
@@ -105,9 +127,8 @@ st.sidebar.subheader("ROI 模式")
 roi_mode = st.sidebar.radio(
     "選擇 ROI 來源",
     ["Auto (from trajectories bbox)", "Manual ROI_0 + Split Left/Right 1/3"],
-    key="roi_mode"
+    key="roi_mode",
 )
-
 
 st.sidebar.subheader("Heatmap bin 大小")
 bin_mm = st.sidebar.number_input("bin (mm)", value=2.0, step=0.5, min_value=0.1)
@@ -210,16 +231,20 @@ with st.sidebar.expander("打開量測工具", expanded=False):
 
         if img_file is not None:
             img = Image.open(img_file).convert("RGB")
+            img = resize_if_too_large(img, max_side=1600)
             w, h = img.size
 
             st.write(f"Image size: {w}×{h} px")
             st.caption("點一下回報座標；若要定 ROI_0，請連點兩次（左上→右下）。")
 
+            bg_url = pil_to_data_url(img, fmt="PNG")
+
+            # ✅ 關鍵：用 background_image_url（data URL），避免 Cloud 的 image_to_url 出錯
             canvas = st_canvas(
                 fill_color="rgba(255, 0, 0, 0.0)",
                 stroke_width=2,
                 stroke_color="rgba(0, 255, 255, 1.0)",
-                background_image=img,
+                background_image_url=bg_url,
                 update_streamlit=True,
                 height=h,
                 width=w,
@@ -258,7 +283,7 @@ with st.sidebar.expander("打開量測工具", expanded=False):
                 if len(st.session_state.roi_pts) > 0:
                     st.write("Points (px):", st.session_state.roi_pts)
 
-            # ROI_0 兩點 → 數值 + 預覽
+            # ROI_0 兩點 → 數值 + 預覽 + Apply
             if len(st.session_state.roi_pts) >= 2:
                 (x1p, y1p) = st.session_state.roi_pts[0]
                 (x2p, y2p) = st.session_state.roi_pts[1]
@@ -271,7 +296,7 @@ with st.sidebar.expander("打開量測工具", expanded=False):
                 st.markdown("**ROI_0 (mm)**")
                 st.code(f"({rx1*px_to_mm:.2f}, {ry1*px_to_mm:.2f}, {rx2*px_to_mm:.2f}, {ry2*px_to_mm:.2f})")
 
-                # 分割線預覽（用 matplotlib 疊在 PNG 上，座標系採影像座標 origin='upper'）
+                # 分割線預覽（用 matplotlib 疊在 PNG 上）
                 figp, axp = plt.subplots(figsize=(6, 4))
                 axp.imshow(img, origin="upper")
                 axp.add_patch(Rectangle((rx1, ry1), rx2 - rx1, ry2 - ry1, fill=False, lw=2))
@@ -285,36 +310,32 @@ with st.sidebar.expander("打開量測工具", expanded=False):
                 axp.set_ylabel("Y (px)")
                 st.pyplot(figp)
 
+                # ✅ Apply 按鈕（只用 session_state.roi_pts 計算，不會 NameError）
+                col_ap1, col_ap2 = st.columns([1, 2])
+                with col_ap1:
+                    if st.button("✅ Apply ROI to plots", key="btn_apply_roi_to_plots"):
+                        st.session_state["roi0_x1"] = float(rx1)
+                        st.session_state["roi0_y1"] = float(ry1)
+                        st.session_state["roi0_x2"] = float(rx2)
+                        st.session_state["roi0_y2"] = float(ry2)
+
+                        # 切到 Manual 模式
+                        st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
+
+                        # 自動只顯示 ROI_0 + Left/Right（含 mid 視 include_mid）
+                        wanted = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
+                        if st.session_state.get("include_mid", True):
+                            wanted.insert(2, "ROI_MID_1_3")
+                        st.session_state["show_rois"] = wanted
+
+                        st.rerun()
+                with col_ap2:
+                    st.caption("按下後：ROI_0 會自動填入 Manual ROI_0，並讓下方 px 軌跡圖只顯示 ROI_0 + Left/Right（可選含 MID）。")
+
                 st.caption("若你要分析左右兩側：建議 ROI_0 框包含完整 device 外框，左右 1/3 會自動從 ROI_0 切出。")
-                
-# --- Apply ROI to plots（一鍵套用到 Manual ROI_0 + 只顯示 ROI_0/L/R） ---
-col_ap1, col_ap2 = st.columns([1, 2])
-with col_ap1:
-    if st.button("✅ Apply ROI to plots", key="btn_apply_roi_to_plots"):
-        # 1) 寫入 Manual ROI_0 的四個 session_state（對應 number_input keys）
-        st.session_state["roi0_x1"] = float(rx1)
-        st.session_state["roi0_y1"] = float(ry1)
-        st.session_state["roi0_x2"] = float(rx2)
-        st.session_state["roi0_y2"] = float(ry2)
+            else:
+                st.info("提示：要啟用 Apply ROI，請先在 PNG 上點兩次定義 ROI_0。")
 
-        # 2) 強制切到 Manual Split 模式（如果你希望自動切換）
-        #    注意：roi_mode 若你用的是 st.sidebar.radio 沒有 key，這裡就無法改。
-        #    若你想能自動切換，請把 roi_mode radio 也加 key="roi_mode"
-        #    然後在這裡設定：
-        st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
-
-        # 3) 自動把 show_rois 改成只顯示 ROI_0 + Left/Right（+MID 依你的 include_mid）
-        wanted = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
-        if st.session_state.get("include_mid", True):  # 若你 include_mid checkbox 有 key 才能讀
-            wanted.insert(2, "ROI_MID_1_3")
-
-        # 這裡先寫入，rerun 後 multiselect 會套用
-        st.session_state["show_rois"] = wanted
-
-        st.rerun()
-
-with col_ap2:
-    st.caption("按下後：ROI_0 會自動填入 Manual ROI_0，並讓下方 px 軌跡圖只顯示 ROI_0 + Left/Right（可選含 MID）。")
 
 # ---------------------- Manual ROI_0 inputs（可被量測工具一鍵填入） ----------------------
 st.sidebar.markdown("---")
@@ -327,7 +348,6 @@ roi0_x2 = st.sidebar.number_input("ROI_0 x2 (px)", value=float(st.session_state.
 roi0_y2 = st.sidebar.number_input("ROI_0 y2 (px)", value=float(st.session_state.get("roi0_y2", 0.0)), step=1.0, key="roi0_y2")
 
 include_mid = st.sidebar.checkbox("也生成中間 1/3 ROI", value=True, key="include_mid")
-
 
 col_fill, col_hint = st.sidebar.columns([1, 1])
 with col_fill:
@@ -453,13 +473,12 @@ def in_rect(xy_px, rect):
 df_dwell_rows = []
 for i in ids:
     xy_px = positions_px[i][frame_start : frame_end + 1, :]
-    xy_mm = per_id[i]["xy_mm"]
     spd = per_id[i]["speed"]
     ang = per_id[i]["angvel"]
 
     for roi in ROI_RANGES:
         name = roi["name"]
-        mask = in_rect(xy_px, roi["rect"])  # ROI 判定用 px（與 Fiji/影像座標一致）
+        mask = in_rect(xy_px, roi["rect"])  # ROI 判定用 px
         frames_in = int(np.count_nonzero(mask))
         mean_spd = float(np.nanmean(np.where(mask, spd, np.nan)))
         mean_ang = float(np.nanmean(np.where(mask, ang, np.nan)))
@@ -475,7 +494,7 @@ for i in ids:
             }
         )
 
-# 確保 df_dwell 即使空也有 columns（避免 KeyError）
+# 確保 df_dwell 即使空也有 columns
 df_dwell = pd.DataFrame(
     df_dwell_rows,
     columns=["ID", "ROI", "Frames_in_ROI", "Time_in_ROI_s", "Mean_speed_mm_s", "Mean_ang_deg_s"],
@@ -492,9 +511,8 @@ show_rois = st.sidebar.multiselect(
     "要在圖上顯示哪些 ROI？",
     options=roi_names,
     default=default_show,
-    key="show_rois"
+    key="show_rois",
 )
-
 
 
 # ---------------------- 左右 ROI 分析（只在 Manual Split 模式顯示） ----------------------
