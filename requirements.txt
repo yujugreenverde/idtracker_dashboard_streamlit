@@ -4,3 +4,5 @@ pandas
 h5py
 matplotlib
 xlsxwriter
+Pillow
+streamlit-drawable-canvas==0.9.3
