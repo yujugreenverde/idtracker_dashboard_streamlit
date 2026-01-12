@@ -126,30 +126,34 @@ else:
     st.caption("建議：用 Fiji 抽一張 frame 存 PNG，上傳後用滑鼠點一下就會記錄座標；連點兩次可定義 ROI_0（左上→右下）。")
 
     if img_file_main is not None:
-        img0 = Image.open(img_file_main).convert("RGB")
+        img0 = Image.open(img_file_main).convert("RGB")  # ✅ 用 RGB（先不要 RGBA）
         w0, h0 = img0.size
-
-        # 固定顯示寬度（避免原圖太大導致 canvas 事件不穩）
-        disp_w = st.slider("顯示寬度 (px)", min_value=400, max_value=1200, value=min(900, w0), step=50)
+        
+        disp_w = st.slider("顯示寬度 (px)", 500, 1200, 900, 50)
         scale = disp_w / float(w0)
         disp_h = int(h0 * scale)
-
+        
         img_disp = img0.resize((disp_w, disp_h))
-
-        st.write(f"Original: {w0}×{h0}px ｜ Display: {disp_w}×{disp_h}px ｜ scale={scale:.4f}")
-
+        
+        # ✅ 先確認圖片可顯示（除錯用）
+        st.image(img_disp, caption="Debug: st.image 顯示正常代表圖片本身沒問題", use_container_width=False)
+        
         canvas = st_canvas(
-            fill_color="rgba(255, 0, 0, 0.0)",
-            stroke_width=2,
-            stroke_color="rgba(0, 255, 255, 1.0)",
-            background_image=img_disp,
+            background_color="white",             # ✅ 避免黑底
+            background_image=img_disp,            # ✅ 丟縮放後的 PIL Image
             update_streamlit=True,
             height=disp_h,
             width=disp_w,
             drawing_mode="point",
             point_display_radius=4,
+            stroke_width=2,
+            stroke_color="rgba(0,255,255,1)",
+            fill_color="rgba(255,0,0,0)",
             key="roi_measure_canvas_main",
         )
+        
+        st.write("objects =", 0 if canvas.json_data is None else len(canvas.json_data.get("objects", [])))
+
 
         def _get_last_point_px(canvas_json):
             """相容不同版本的 point 座標欄位"""
