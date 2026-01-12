@@ -439,6 +439,20 @@ max_frame = max(0, total_frames - 1)
 frame_start = st.sidebar.number_input("Start frame", 0, max_frame, 0, key="frame_start")
 frame_end = st.sidebar.number_input("End frame", 0, max_frame, max_frame, key="frame_end")
 
+# ✅ safeguard: 如果在 Manual 模式但 ROI_0 還沒填、且 roi_pts 有兩點，就自動回填
+if str(st.session_state.get("roi_mode", "")).startswith("Manual"):
+    x1, y1 = float(st.session_state.get("roi0_x1", 0.0)), float(st.session_state.get("roi0_y1", 0.0))
+    x2, y2 = float(st.session_state.get("roi0_x2", 0.0)), float(st.session_state.get("roi0_y2", 0.0))
+    if (x2 <= x1) or (y2 <= y1):
+        pts = st.session_state.get("roi_pts", [])
+        if isinstance(pts, list) and len(pts) >= 2:
+            (x1p, y1p), (x2p, y2p) = pts[0], pts[1]
+            st.session_state["roi0_x1"] = float(min(x1p, x2p))
+            st.session_state["roi0_y1"] = float(min(y1p, y2p))
+            st.session_state["roi0_x2"] = float(max(x1p, x2p))
+            st.session_state["roi0_y2"] = float(max(y1p, y2p))
+
+
 ROI_RANGES = []
 if roi_mode.startswith("Auto"):
     detected_bbox = _detect_outer_bbox_from_file(tmp_path)
