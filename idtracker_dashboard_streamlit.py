@@ -125,6 +125,12 @@ def _safe_bins(vmin, vmax, bin_size, max_bins=800):
 st.set_page_config(layout="wide")
 st.title("🐭 idtracker.ai Dashboard")
 
+# ---- apply pending ROI0 BEFORE widgets are created ----
+for k in ["roi0_x1", "roi0_y1", "roi0_x2", "roi0_y2"]:
+    pk = f"{k}_pending"
+    if pk in st.session_state:
+        st.session_state[k] = st.session_state.pop(pk)
+
 # ---- apply pending widget state BEFORE widgets are created ----
 if "roi_mode_pending" in st.session_state:
     st.session_state["roi_mode"] = st.session_state.pop("roi_mode_pending")
@@ -447,10 +453,12 @@ if str(st.session_state.get("roi_mode", "")).startswith("Manual"):
         pts = st.session_state.get("roi_pts", [])
         if isinstance(pts, list) and len(pts) >= 2:
             (x1p, y1p), (x2p, y2p) = pts[0], pts[1]
-            st.session_state["roi0_x1"] = float(min(x1p, x2p))
-            st.session_state["roi0_y1"] = float(min(y1p, y2p))
-            st.session_state["roi0_x2"] = float(max(x1p, x2p))
-            st.session_state["roi0_y2"] = float(max(y1p, y2p))
+            st.session_state["roi0_x1_pending"] = float(min(x1p, x2p))
+            st.session_state["roi0_y1_pending"] = float(min(y1p, y2p))
+            st.session_state["roi0_x2_pending"] = float(max(x1p, x2p))
+            st.session_state["roi0_y2_pending"] = float(max(y1p, y2p))
+            st.rerun()
+
 
 
 ROI_RANGES = []
