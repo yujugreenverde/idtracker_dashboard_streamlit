@@ -1,3 +1,4 @@
+streamlit==1.29.0
 streamlit-drawable-canvas==0.9.3
 Pillow
 xlsxwriter
@@ -5,4 +6,3 @@ matplotlib
 h5py
 pandas
 numpy
-streamlit
