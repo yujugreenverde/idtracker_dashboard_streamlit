@@ -175,12 +175,13 @@ else:
         disp_h = int(h0 * scale)
 
         img_disp = img0.resize((disp_w, disp_h))
-        st_image_compat(img_disp, caption=f"Debug: image ok ({disp_w}×{disp_h})")
 
-        # 用 data URL 當背景（最穩）
+        # ✅ 不要用 st.image 顯示 img_disp（會造成你點到 st.image 而不是 canvas）
+        # st_image_compat(img_disp, caption=f"Debug: image ok ({disp_w}×{disp_h})")  # ← 刪掉
+
         bg_url = pil_to_data_url(img_disp, fmt="PNG")
 
-        # 盡量用 background_image_url（若版本不支援就 fallback）
+        # ✅ 只保留一個「可見 + 可點」的元件：canvas
         try:
             canvas = st_canvas(
                 background_color="white",
@@ -195,7 +196,6 @@ else:
                 key="roi_measure_canvas_main",
             )
         except TypeError:
-            # fallback：舊版本可能沒有 background_image_url
             canvas = st_canvas(
                 background_color="white",
                 background_image=img_disp,
@@ -228,12 +228,13 @@ else:
             except Exception:
                 return None
 
+        n_obj = 0 if canvas.json_data is None else len(canvas.json_data.get("objects", []))
+        st.write("objects =", n_obj)
+
         pt = _get_last_point_px(canvas.json_data)
-        st.write("objects =", 0 if canvas.json_data is None else len(canvas.json_data.get("objects", [])))
 
         if pt is not None:
             x_disp, y_disp = pt
-            # 轉回原圖座標
             x_px = x_disp / scale
             y_px = y_disp / scale
             x_mm = x_px * px_to_mm
@@ -286,9 +287,9 @@ else:
                 st.session_state["roi0_x2"] = float(rx2)
                 st.session_state["roi0_y2"] = float(ry2)
                 st.session_state["roi_mode"] = "Manual ROI_0 + Split Left/Right 1/3"
-                # show_rois 會在下面 multiselect 接手
                 st.session_state["show_rois"] = ["ROI_0", "ROI_LEFT_1_3", "ROI_RIGHT_1_3"]
                 st.rerun()
+
 
 
 # ---------------------- 載入軌跡 ----------------------
