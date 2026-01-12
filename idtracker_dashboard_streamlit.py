@@ -317,35 +317,54 @@ st.dataframe(df_dwell, use_container_width=True)
 # ---------------------- Two-ROI Preference ----------------------
 df_pref = None
 if roi_mode.startswith("Two-ROI"):
-    # 支援兩種 naming
-    left_name = "ROI_LEFT_1_3" if "ROI_LEFT_1_3" in df_dwell["ROI"].unique() else "ROI_LEFT"
-    right_name = "ROI_RIGHT_1_3" if "ROI_RIGHT_1_3" in df_dwell["ROI"].unique() else "ROI_RIGHT"
+    # 防呆：df_dwell 必須存在且包含 ROI 欄位
+    if (df_dwell is None) or (df_dwell.empty) or ("ROI" not in df_dwell.columns):
+        st.warning("尚未產生 ROI 統計（可能 ROI_0 尚未有效輸入、或 frame/軌跡資料不足），因此略過 Preference Index 計算。")
+    else:
+        roi_set = set(df_dwell["ROI"].dropna().unique().tolist())
 
-    if left_name in df_dwell["ROI"].unique() and right_name in df_dwell["ROI"].unique():
-        pivot = df_dwell.pivot_table(index="ID", columns="ROI", values="Time_in_ROI_s", aggfunc="sum").fillna(0.0)
-        tL = pivot.get(left_name, pd.Series(0.0, index=pivot.index))
-        tR = pivot.get(right_name, pd.Series(0.0, index=pivot.index))
-        denom = (tL + tR).replace(0, np.nan)
-        pi = (tL - tR) / denom
+        # 支援兩種 naming
+        left_name = "ROI_LEFT_1_3" if "ROI_LEFT_1_3" in roi_set else ("ROI_LEFT" if "ROI_LEFT" in roi_set else None)
+        right_name = "ROI_RIGHT_1_3" if "ROI_RIGHT_1_3" in roi_set else ("ROI_RIGHT" if "ROI_RIGHT" in roi_set else None)
 
-        df_pref = pd.DataFrame({
-            "ID": pivot.index,
-            "Time_Left_s": np.round(tL.values, 3),
-            "Time_Right_s": np.round(tR.values, 3),
-            "PreferenceIndex_(L-R)/(L+R)": np.round(pi.values, 3),
-        })
+        if left_name is None or right_name is None:
+            st.warning("df_dwell 中找不到左右 ROI（ROI_LEFT_1_3 / ROI_RIGHT_1_3 或 ROI_LEFT / ROI_RIGHT），略過 Preference Index。")
+        else:
+            pivot = (
+                df_dwell.pivot_table(index="ID", columns="ROI", values="Time_in_ROI_s", aggfunc="sum")
+                .fillna(0.0)
+            )
+            tL = pivot.get(left_name, pd.Series(0.0, index=pivot.index))
+            tR = pivot.get(right_name, pd.Series(0.0, index=pivot.index))
 
-        st.subheader("左右偏好指標 (Preference Index)")
-        st.dataframe(df_pref, use_container_width=True)
+            denom = (tL + tR).replace(0, np.nan)
+            pi = (tL - tR) / denom
 
-        TL = float(np.nansum(tL.values))
-        TR = float(np.nansum(tR.values))
-        PI_all = (TL - TR) / (TL + TR) if (TL + TR) > 0 else np.nan
-        st.caption(f"All IDs total: Left={TL:.3f}s, Right={TR:.3f}s, PI={PI_all:.3f}")
+            df_pref = pd.DataFrame({
+                "ID": pivot.index,
+                "Time_Left_s": np.round(tL.values, 3),
+                "Time_Right_s": np.round(tR.values, 3),
+                "PreferenceIndex_(L-R)/(L+R)": np.round(pi.values, 3),
+            })
+
+            st.subheader("左右偏好指標 (Preference Index)")
+            st.dataframe(df_pref, use_container_width=True)
+
+            TL = float(np.nansum(tL.values))
+            TR = float(np.nansum(tR.values))
+            PI_all = (TL - TR) / (TL + TR) if (TL + TR) > 0 else np.nan
+            st.caption(f"All IDs total: Left={TL:.3f}s, Right={TR:.3f}s, PI={PI_all:.3f}")
 
 # ---------------------- ROI 顯示選項 ----------------------
 roi_names = [r["name"] for r in ROI_RANGES]
-show_rois = st.sidebar.multiselect("要在圖上顯示哪些 ROI？", options=roi_names, default=roi_names)
+st.sidebar.caption(f"ROI count = {len(ROI_RANGES)}")
+
+default_show = roi_names if len(roi_names) > 0 else []
+show_rois = st.sidebar.multiselect(
+    "要在圖上顯示哪些 ROI？",
+    options=roi_names,
+    default=default_show
+)
 
 # ---------------------- 視覺化：軌跡 (mm) ----------------------
 st.subheader("軌跡圖 (mm)")
