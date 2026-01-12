@@ -6,4 +6,4 @@ matplotlib
 h5py
 pandas
 numpy
-streamlit-image-coordinates
+streamlit-image-coordinates==0.1.6
