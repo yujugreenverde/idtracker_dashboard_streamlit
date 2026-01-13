@@ -1,13 +1,12 @@
 # idtracker_dashboard_streamlit.py
-# 覆蓋版（2026-01-13 / FIX v2.4）
-# 版本變更說明（在 v2.3 基礎上新增）：
-# 7) ✅ 新增 FirstEntry 表：在指定 frame 區間內，計算每個 ID
-#    - First_entry_focal_frame / First_entry_other_frame
-#    - First_entry_is_focal（True/False/None/Tie）
-#    - First_inside_focal_frame / First_inside_other_frame（區間內第一個 inside=True）
-#    - ✅ Entry_count_focal / Entry_count_other（進入次數；你指定：區間第一格就在 ROI 內 → 算作一次「進入」）
-#    - 以及對應的 time(s)（相對 frame_start）
-# 8) ✅ 匯出（Excel/CSV/PDF/ZIP）新增：FirstEntry（sheet/檔案）
+# 覆蓋版（2026-01-13 / FIX v2.4.1）
+# 版本變更說明（在 v2.4 基礎上新增）：
+# 9) ✅ FirstEntry 表格欄位「前置排序」：一打開就看得到
+#    - First_inside_is_focal（你說的「第一次所在區域是否為 focal」；以 first INSIDE 判定）
+#    - First_entry_is_focal（第一次進入事件是否為 focal；以 first ENTRY 判定）
+#    - Entry_count_focal / Entry_count_other（進入次數；區間第一格在 ROI 內也算一次）
+# 10) ✅ 新增欄位：First_inside_is_focal（None/True/False/Tie）
+# 11) ✅ 匯出 FirstEntry（Excel/CSV/PDF/ZIP）同步帶出 First_inside_is_focal
 #
 # requirements.txt 建議：
 # streamlit
@@ -139,7 +138,7 @@ if "roi_mode_pending" in st.session_state:
 if "show_rois_pending" in st.session_state:
     st.session_state["show_rois"] = st.session_state.pop("show_rois_pending")
 
-# ✅ new: px_to_mm pending (avoid StreamlitAPIException)
+# ✅ px_to_mm pending (avoid StreamlitAPIException)
 if "px_to_mm_pending" in st.session_state:
     st.session_state["px_to_mm"] = st.session_state.pop("px_to_mm_pending")
 
@@ -546,7 +545,7 @@ def in_rect(xy_px, rect):
     return (xy_px[:, 0] >= x1) & (xy_px[:, 0] <= x2) & (xy_px[:, 1] >= y1) & (xy_px[:, 1] <= y2)
 
 
-# ---- FirstEntry helper funcs (v2.4) ----
+# ---- FirstEntry helper funcs ----
 def _finite_xy_mask(xy_px):
     return np.isfinite(xy_px[:, 0]) & np.isfinite(xy_px[:, 1])
 
@@ -562,8 +561,8 @@ def first_inside_frame(mask_bool, frame_start_abs):
 def first_entry_frame(mask_bool, frame_start_abs):
     """
     回傳區間內「進入」的第一個 absolute frame。
-    你指定的定義：區間第一格就在 ROI 裡 → 算作一次「進入」
-    entry 定義：mask[t]=True 且 mask[t-1]=False（t=0 時 prev=False）
+    定義（依你的要求）：區間第一格就在 ROI 裡 → 算作一次「進入」
+    entry：mask[t]=True 且 mask[t-1]=False（t=0 時 prev=False）
     """
     if mask_bool is None or len(mask_bool) == 0:
         return None
@@ -636,7 +635,7 @@ show_rois = st.sidebar.multiselect(
 
 # ---------------------- 左右 ROI 分析（只在 Manual Split 模式顯示） ----------------------
 df_pref = pd.DataFrame()
-df_first_entry = pd.DataFrame()  # v2.4: make sure exists
+df_first_entry = pd.DataFrame()
 if roi_mode.startswith("Manual"):
     st.subheader("左右 ROI 分析（Left/Right 1/3）")
     if df_dwell.empty:
@@ -658,10 +657,7 @@ if roi_mode.startswith("Manual"):
             pi_raw = (tL - tR) / denom
 
             # ✅ focal-aligned PI: focal side as positive
-            if focal_side == "Left":
-                pi_focal = pi_raw
-            else:
-                pi_focal = -pi_raw
+            pi_focal = pi_raw if focal_side == "Left" else -pi_raw
 
             df_pref = pd.DataFrame(
                 {
@@ -686,8 +682,8 @@ if roi_mode.startswith("Manual"):
                 f"PI_raw={PI_all_raw:.3f} | PI_focal={PI_all_focal:.3f} (focal={focal_side})"
             )
 
-            # ---------------------- First entry + Entry counts (v2.4) ----------------------
-            st.markdown("### ⏱️ First entry（指定 frame 區間內第一次進入 focal/other）")
+            # ---------------------- First entry + Entry counts (v2.4.1) ----------------------
+            st.markdown("### ⏱️ First entry（指定 frame 區間內：第一次所在區域 / 第一次進入 / 進入次數）")
 
             focal_roi_name = left_name if focal_side == "Left" else right_name
             other_roi_name = right_name if focal_side == "Left" else left_name
@@ -702,7 +698,6 @@ if roi_mode.startswith("Manual"):
                 rows = []
                 for i in ids:
                     xy_px = positions_px[i][frame_start: frame_end + 1, :]
-
                     fin = _finite_xy_mask(xy_px)
 
                     mask_focal = np.zeros(xy_px.shape[0], dtype=bool)
@@ -720,19 +715,35 @@ if roi_mode.startswith("Manual"):
                     cnt_focal = entry_count(mask_focal)
                     cnt_other = entry_count(mask_other)
 
+                    # ---- 判定：first INSIDE 是否為 focal（你說的「第一次所在區域」） ----
+                    if fi_focal_inside is None and fi_other_inside is None:
+                        inside_is_focal = None
+                    elif fi_focal_inside is not None and fi_other_inside is None:
+                        inside_is_focal = True
+                    elif fi_focal_inside is None and fi_other_inside is not None:
+                        inside_is_focal = False
+                    else:
+                        if fi_focal_inside < fi_other_inside:
+                            inside_is_focal = True
+                        elif fi_other_inside < fi_focal_inside:
+                            inside_is_focal = False
+                        else:
+                            inside_is_focal = "Tie"
+
+                    # ---- 判定：first ENTRY 是否為 focal（第一次「進入事件」） ----
                     if fe_focal is None and fe_other is None:
-                        is_focal = None
+                        entry_is_focal = None
                     elif fe_focal is not None and fe_other is None:
-                        is_focal = True
+                        entry_is_focal = True
                     elif fe_focal is None and fe_other is not None:
-                        is_focal = False
+                        entry_is_focal = False
                     else:
                         if fe_focal < fe_other:
-                            is_focal = True
+                            entry_is_focal = True
                         elif fe_other < fe_focal:
-                            is_focal = False
+                            entry_is_focal = False
                         else:
-                            is_focal = "Tie"
+                            entry_is_focal = "Tie"
 
                     rows.append(
                         {
@@ -744,9 +755,10 @@ if roi_mode.startswith("Manual"):
                             "Other_ROI": other_roi_name,
                             "First_inside_focal_frame": fi_focal_inside,
                             "First_inside_other_frame": fi_other_inside,
+                            "First_inside_is_focal": inside_is_focal,  # ✅ v2.4.1
                             "First_entry_focal_frame": fe_focal,
                             "First_entry_other_frame": fe_other,
-                            "First_entry_is_focal": is_focal,
+                            "First_entry_is_focal": entry_is_focal,
                             "Entry_count_focal": cnt_focal,
                             "Entry_count_other": cnt_other,
                             "First_entry_focal_time_s": (None if fe_focal is None else round((fe_focal - frame_start) / fps, 3)),
@@ -755,12 +767,33 @@ if roi_mode.startswith("Manual"):
                     )
 
                 df_first_entry = pd.DataFrame(rows)
+
+                # ✅ 前置排序：一打開就看到你要的欄位
+                front_cols = [
+                    "ID",
+                    "First_inside_is_focal",
+                    "First_entry_is_focal",
+                    "Entry_count_focal",
+                    "Entry_count_other",
+                    "First_inside_focal_frame",
+                    "First_inside_other_frame",
+                    "First_entry_focal_frame",
+                    "First_entry_other_frame",
+                    "First_entry_focal_time_s",
+                    "First_entry_other_time_s",
+                ]
+                front_cols = [c for c in front_cols if c in df_first_entry.columns]
+                df_first_entry = df_first_entry[front_cols + [c for c in df_first_entry.columns if c not in front_cols]]
+
                 st.dataframe(df_first_entry, use_container_width=True)
 
-                vc = df_first_entry["First_entry_is_focal"].value_counts(dropna=False).to_dict()
+                vc_inside = df_first_entry["First_inside_is_focal"].value_counts(dropna=False).to_dict()
+                vc_entry = df_first_entry["First_entry_is_focal"].value_counts(dropna=False).to_dict()
                 total_focal_entries = int(np.nansum(df_first_entry["Entry_count_focal"].values))
                 total_other_entries = int(np.nansum(df_first_entry["Entry_count_other"].values))
-                st.caption(f"First_entry_is_focal counts: {vc}")
+
+                st.caption(f"First_inside_is_focal counts: {vc_inside}")
+                st.caption(f"First_entry_is_focal counts: {vc_entry}")
                 st.caption(f"Total entry counts (all IDs): focal={total_focal_entries}, other={total_other_entries}")
 
 
@@ -807,10 +840,9 @@ ax.set_ylabel("Y (px)")
 ax.legend(fontsize=6, loc="best")
 st.pyplot(fig)
 
-# ✅ FIX: Heatmap(mm) create a fresh fig/ax
+# ✅ Heatmap(mm)
 st.subheader("Heatmap (mm)")
 all_xy_mm_plot = np.vstack([d["xy_mm"] for d in per_id.values()])
-
 finite_mask = np.isfinite(all_xy_mm_plot[:, 0]) & np.isfinite(all_xy_mm_plot[:, 1])
 xy_finite = all_xy_mm_plot[finite_mask]
 
@@ -843,10 +875,9 @@ else:
     ax.set_ylabel("Y (mm)")
     st.pyplot(fig)
 
-# ✅ FIX: Heatmap(px) create a fresh fig/ax
+# ✅ Heatmap(px)
 st.subheader("Heatmap (px)")
 all_xy_px_plot = np.vstack([positions_px[i][frame_start: frame_end + 1, :] for i in ids])
-
 finite_mask = np.isfinite(all_xy_px_plot[:, 0]) & np.isfinite(all_xy_px_plot[:, 1])
 xy_finite = all_xy_px_plot[finite_mask]
 
@@ -936,12 +967,12 @@ if df_pref is None or not isinstance(df_pref, pd.DataFrame) or df_pref.empty:
 else:
     df_pref_export = df_pref.copy()
 
-# Ensure df_first_entry exists even in Auto mode (v2.4)
+# Ensure df_first_entry exists even in Auto mode
 if df_first_entry is None or not isinstance(df_first_entry, pd.DataFrame) or df_first_entry.empty:
     df_first_entry_export = pd.DataFrame(
         columns=[
             "Experiment_ID", "Condition", "Focal_side", "ID", "Focal_ROI", "Other_ROI",
-            "First_inside_focal_frame", "First_inside_other_frame",
+            "First_inside_focal_frame", "First_inside_other_frame", "First_inside_is_focal",
             "First_entry_focal_frame", "First_entry_other_frame", "First_entry_is_focal",
             "Entry_count_focal", "Entry_count_other",
             "First_entry_focal_time_s", "First_entry_other_time_s",
@@ -956,7 +987,7 @@ if st.button("⬇️ 匯出 Excel"):
         df_global.to_excel(writer, sheet_name="Global", index=False)
         df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
         df_pref_export.to_excel(writer, sheet_name="PreferenceIndex", index=False)
-        df_first_entry_export.to_excel(writer, sheet_name="FirstEntry", index=False)  # v2.4
+        df_first_entry_export.to_excel(writer, sheet_name="FirstEntry", index=False)
         df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
         df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
     excel_buf.seek(0)
@@ -983,7 +1014,7 @@ if st.button("⬇️ 匯出 PDF"):
         _pdf_table(df_global, "Global", fontsize=8, fig_w=8, fig_h=2)
         _pdf_table(df_dwell, "ROI_Summary", fontsize=6, fig_w=10, fig_h=4)
         _pdf_table(df_pref_export, "PreferenceIndex", fontsize=7, fig_w=10, fig_h=3)
-        _pdf_table(df_first_entry_export, "FirstEntry", fontsize=7, fig_w=10, fig_h=3)  # v2.4
+        _pdf_table(df_first_entry_export, "FirstEntry", fontsize=7, fig_w=10, fig_h=3)
         _pdf_table(df_roi_ranges, "ROI_Ranges", fontsize=7, fig_w=10, fig_h=3)
         _pdf_table(df_meta, "Meta_Info", fontsize=8, fig_w=8, fig_h=2)
 
@@ -999,7 +1030,7 @@ if st.button("⬇️ 匯出 ZIP"):
             df_global.to_excel(writer, sheet_name="Global", index=False)
             df_dwell.to_excel(writer, sheet_name="ROI_Summary", index=False)
             df_pref_export.to_excel(writer, sheet_name="PreferenceIndex", index=False)
-            df_first_entry_export.to_excel(writer, sheet_name="FirstEntry", index=False)  # v2.4
+            df_first_entry_export.to_excel(writer, sheet_name="FirstEntry", index=False)
             df_roi_ranges.to_excel(writer, sheet_name="ROI_Ranges", index=False)
             df_meta.to_excel(writer, sheet_name="Meta_Info", index=False)
         excel_bytes.seek(0)
@@ -1009,7 +1040,7 @@ if st.button("⬇️ 匯出 ZIP"):
         zf.writestr("global_summary.csv", df_global.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("roi_summary.csv", df_dwell.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("preference_index.csv", df_pref_export.to_csv(index=False).encode("utf-8-sig"))
-        zf.writestr("first_entry.csv", df_first_entry_export.to_csv(index=False).encode("utf-8-sig"))  # v2.4
+        zf.writestr("first_entry.csv", df_first_entry_export.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("roi_ranges.csv", df_roi_ranges.to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("meta_info.csv", df_meta.to_csv(index=False).encode("utf-8-sig"))
 
